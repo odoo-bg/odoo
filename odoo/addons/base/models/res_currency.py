@@ -1,19 +1,21 @@
 # -*- coding: utf-8 -*-
 # Part of Odoo. See LICENSE file for full copyright and licensing details.
 
-import json
 import logging
 import math
 import re
 import time
+import traceback
+
+from odoo import api, fields, models, tools, _
+
+_logger = logging.getLogger(__name__)
 
 try:
     from num2words import num2words
 except ImportError:
-    logging.getLogger(__name__).warning("The num2words python library is not installed, l10n_mx_edi features won't be fully available.")
+    _logger.warning("The num2words python library is not installed, amount-to-text features won't be fully available.")
     num2words = None
-
-from odoo import api, fields, models, tools, _
 
 CURRENCY_DISPLAY_PATTERN = re.compile(r'(\w+)\s*(?:\((.*)\))?')
 
@@ -26,11 +28,11 @@ class Currency(models.Model):
     # Note: 'code' column was removed as of v6.0, the 'name' should now hold the ISO code.
     name = fields.Char(string='Currency', size=3, required=True, help="Currency Code (ISO 4217)")
     symbol = fields.Char(help="Currency sign, to be used when printing amounts.", required=True)
-    rate = fields.Float(compute='_compute_current_rate', string='Current Rate', digits=(12, 6),
+    rate = fields.Float(compute='_compute_current_rate', string='Current Rate', digits=0,
                         help='The rate of the currency to the currency of rate 1.')
     rate_ids = fields.One2many('res.currency.rate', 'currency_id', string='Rates')
     rounding = fields.Float(string='Rounding Factor', digits=(12, 6), default=0.01)
-    decimal_places = fields.Integer(compute='_compute_decimal_places')
+    decimal_places = fields.Integer(compute='_compute_decimal_places', store=True)
     active = fields.Boolean(default=True)
     position = fields.Selection([('after', 'After Amount'), ('before', 'Before Amount')], default='after',
         string='Symbol Position', help="Determines where the currency symbol should be placed after or before the amount.")
@@ -43,24 +45,29 @@ class Currency(models.Model):
         ('rounding_gt_zero', 'CHECK (rounding>0)', 'The rounding factor must be greater than 0!')
     ]
 
-    @api.multi
-    def _compute_current_rate(self):
-        date = self._context.get('date') or fields.Date.today()
-        company_id = self._context.get('company_id') or self.env['res.users']._get_company().id
-        # the subquery selects the last rate before 'date' for the given currency/company
-        query = """SELECT c.id, (SELECT r.rate FROM res_currency_rate r
+    def _get_rates(self, company, date):
+        self.env['res.currency.rate'].flush(['rate', 'currency_id', 'company_id', 'name'])
+        query = """SELECT c.id,
+                          COALESCE((SELECT r.rate FROM res_currency_rate r
                                   WHERE r.currency_id = c.id AND r.name <= %s
                                     AND (r.company_id IS NULL OR r.company_id = %s)
                                ORDER BY r.company_id, r.name DESC
-                                  LIMIT 1) AS rate
+                                  LIMIT 1), 1.0) AS rate
                    FROM res_currency c
                    WHERE c.id IN %s"""
-        self._cr.execute(query, (date, company_id, tuple(self.ids)))
+        self._cr.execute(query, (date, company.id, tuple(self.ids)))
         currency_rates = dict(self._cr.fetchall())
+        return currency_rates
+
+    @api.depends('rate_ids.rate')
+    def _compute_current_rate(self):
+        date = self._context.get('date') or fields.Date.today()
+        company = self.env['res.company'].browse(self._context.get('company_id')) or self.env.company
+        # the subquery selects the last rate before 'date' for the given currency/company
+        currency_rates = self._get_rates(company, date)
         for currency in self:
             currency.rate = currency_rates.get(currency.id) or 1.0
 
-    @api.multi
     @api.depends('rounding')
     def _compute_decimal_places(self):
         for currency in self:
@@ -69,26 +76,23 @@ class Currency(models.Model):
             else:
                 currency.decimal_places = 0
 
-    @api.multi
     @api.depends('rate_ids.name')
     def _compute_date(self):
         for currency in self:
             currency.date = currency.rate_ids[:1].name
 
     @api.model
-    def name_search(self, name='', args=None, operator='ilike', limit=100):
-        results = super(Currency, self).name_search(name, args, operator=operator, limit=limit)
+    def _name_search(self, name, args=None, operator='ilike', limit=100, name_get_uid=None):
+        results = super(Currency, self)._name_search(name, args, operator=operator, limit=limit, name_get_uid=name_get_uid)
         if not results:
             name_match = CURRENCY_DISPLAY_PATTERN.match(name)
             if name_match:
-                results = super(Currency, self).name_search(name_match.group(1), args, operator=operator, limit=limit)
+                results = super(Currency, self)._name_search(name_match.group(1), args, operator=operator, limit=limit, name_get_uid=name_get_uid)
         return results
 
-    @api.multi
     def name_get(self):
         return [(currency.id, tools.ustr(currency.name)) for currency in self]
 
-    @api.multi
     def amount_to_text(self, amount):
         self.ensure_one()
         def _num2words(number, lang):
@@ -101,36 +105,32 @@ class Currency(models.Model):
             logging.getLogger(__name__).warning("The library 'num2words' is missing, cannot render textual amounts.")
             return ""
 
-        fractional_value, integer_value = math.modf(amount)
-        fractional_amount = round(abs(fractional_value), self.decimal_places) * (math.pow(10, self.decimal_places))
-        lang_code = self.env.context.get('lang') or self.env.user.lang
-        lang = self.env['res.lang'].search([('code', '=', lang_code)])
+        formatted = "%.{0}f".format(self.decimal_places) % amount
+        parts = formatted.partition('.')
+        integer_value = int(parts[0])
+        fractional_value = int(parts[2] or 0)
+
+        lang = tools.get_lang(self.env)
         amount_words = tools.ustr('{amt_value} {amt_word}').format(
-                        amt_value=_num2words(int(integer_value), lang=lang.iso_code),
+                        amt_value=_num2words(integer_value, lang=lang.iso_code),
                         amt_word=self.currency_unit_label,
                         )
-        if not self.is_zero(fractional_value):
+        if not self.is_zero(amount - integer_value):
             amount_words += ' ' + _('and') + tools.ustr(' {amt_value} {amt_word}').format(
-                        amt_value=_num2words(int(fractional_amount), lang=lang.iso_code),
+                        amt_value=_num2words(fractional_value, lang=lang.iso_code),
                         amt_word=self.currency_subunit_label,
                         )
         return amount_words
 
-    @api.multi
     def round(self, amount):
         """Return ``amount`` rounded  according to ``self``'s rounding rules.
 
            :param float amount: the amount to round
            :return: rounded float
         """
-        # TODO: Need to check why it calls round() from sale.py, _amount_all() with *No* ID after below commits,
-        # https://github.com/odoo/odoo/commit/36ee1ad813204dcb91e9f5f20d746dff6f080ac2
-        # https://github.com/odoo/odoo/commit/0b6058c585d7d9a57bd7581b8211f20fca3ec3f7
-        # Removing self.ensure_one() will make few test cases to break of modules event_sale, sale_mrp and stock_dropshipping.
-        #self.ensure_one()
+        self.ensure_one()
         return tools.float_round(amount, precision_rounding=self.rounding)
 
-    @api.multi
     def compare_amounts(self, amount1, amount2):
         """Compare ``amount1`` and ``amount2`` after rounding them according to the
            given currency's precision..
@@ -151,9 +151,9 @@ class Currency(models.Model):
 
            With the new API, call it like: ``currency.compare_amounts(amount1, amount2)``.
         """
+        self.ensure_one()
         return tools.float_compare(amount1, amount2, precision_rounding=self.rounding)
 
-    @api.multi
     def is_zero(self, amount):
         """Returns true if ``amount`` is small enough to be treated as
            zero according to current currency's rounding rules.
@@ -166,36 +166,49 @@ class Currency(models.Model):
 
            With the new API, call it like: ``currency.is_zero(amount)``.
         """
+        self.ensure_one()
         return tools.float_is_zero(amount, precision_rounding=self.rounding)
 
     @api.model
-    def _get_conversion_rate(self, from_currency, to_currency):
-        from_currency = from_currency.with_env(self.env)
-        to_currency = to_currency.with_env(self.env)
-        return to_currency.rate / from_currency.rate
+    def _get_conversion_rate(self, from_currency, to_currency, company, date):
+        currency_rates = (from_currency + to_currency)._get_rates(company, date)
+        res = currency_rates.get(to_currency.id) / currency_rates.get(from_currency.id)
+        return res
 
-    @api.model
-    def _compute(self, from_currency, to_currency, from_amount, round=True):
-        if (to_currency == from_currency):
-            amount = to_currency.round(from_amount) if round else from_amount
-        else:
-            rate = self._get_conversion_rate(from_currency, to_currency)
-            amount = to_currency.round(from_amount * rate) if round else from_amount * rate
-        return amount
+    def _convert(self, from_amount, to_currency, company, date, round=True):
+        """Returns the converted amount of ``from_amount``` from the currency
+           ``self`` to the currency ``to_currency`` for the given ``date`` and
+           company.
 
-    @api.multi
-    def compute(self, from_amount, to_currency, round=True):
-        """ Convert `from_amount` from currency `self` to `to_currency`. """
+           :param company: The company from which we retrieve the convertion rate
+           :param date: The nearest date from which we retriev the conversion rate.
+           :param round: Round the result or not
+        """
         self, to_currency = self or to_currency, to_currency or self
-        assert self, "compute from unknown currency"
-        assert to_currency, "compute to unknown currency"
+        assert self, "convert amount from unknown currency"
+        assert to_currency, "convert amount to unknown currency"
+        assert company, "convert amount from unknown company"
+        assert date, "convert amount from unknown date"
         # apply conversion rate
         if self == to_currency:
             to_amount = from_amount
         else:
-            to_amount = from_amount * self._get_conversion_rate(self, to_currency)
+            to_amount = from_amount * self._get_conversion_rate(self, to_currency, company, date)
         # apply rounding
         return to_currency.round(to_amount) if round else to_amount
+
+    @api.model
+    def _compute(self, from_currency, to_currency, from_amount, round=True):
+        _logger.warning('The `_compute` method is deprecated. Use `_convert` instead')
+        date = self._context.get('date') or fields.Date.today()
+        company = self.env['res.company'].browse(self._context.get('company_id')) or self.env.company
+        return from_currency._convert(from_amount, to_currency, company, date)
+
+    def compute(self, from_amount, to_currency, round=True):
+        _logger.warning('The `compute` method is deprecated. Use `_convert` instead')
+        date = self._context.get('date') or fields.Date.today()
+        company = self.env['res.company'].browse(self._context.get('company_id')) or self.env.company
+        return self._convert(from_amount, to_currency, company, date)
 
     def _select_companies_rates(self):
         return """
@@ -222,10 +235,10 @@ class CurrencyRate(models.Model):
 
     name = fields.Date(string='Date', required=True, index=True,
                            default=lambda self: fields.Date.today())
-    rate = fields.Float(digits=(12, 6), default=1.0, help='The rate of the currency to the currency of rate 1')
+    rate = fields.Float(digits=0, default=1.0, help='The rate of the currency to the currency of rate 1')
     currency_id = fields.Many2one('res.currency', string='Currency', readonly=True)
     company_id = fields.Many2one('res.company', string='Company',
-                                 default=lambda self: self.env.user.company_id)
+                                 default=lambda self: self.env.company)
 
     _sql_constraints = [
         ('unique_name_per_day', 'unique (name,currency_id,company_id)', 'Only one currency rate per day allowed!'),
@@ -233,14 +246,14 @@ class CurrencyRate(models.Model):
     ]
 
     @api.model
-    def name_search(self, name, args=None, operator='ilike', limit=80):
+    def _name_search(self, name, args=None, operator='ilike', limit=100, name_get_uid=None):
         if operator in ['=', '!=']:
             try:
                 date_format = '%Y-%m-%d'
                 if self._context.get('lang'):
-                    langs = self.env['res.lang'].search([('code', '=', self._context['lang'])])
-                    if langs:
-                        date_format = langs.date_format
+                    lang_id = self.env['res.lang']._search([('code', '=', self._context['lang'])], access_rights_uid=name_get_uid)
+                    if lang_id:
+                        date_format = self.browse(lang_id).date_format
                 name = time.strftime('%Y-%m-%d', time.strptime(name, date_format))
             except ValueError:
                 try:
@@ -249,4 +262,4 @@ class CurrencyRate(models.Model):
                     return []
                 name = ''
                 operator = 'ilike'
-        return super(CurrencyRate, self).name_search(name, args=args, operator=operator, limit=limit)
+        return super(CurrencyRate, self)._name_search(name, args=args, operator=operator, limit=limit, name_get_uid=name_get_uid)

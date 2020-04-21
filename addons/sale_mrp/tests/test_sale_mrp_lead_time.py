@@ -71,9 +71,9 @@ class TestSaleMrpLeadTime(TestStockCommon):
 
         # Check schedule date of manufacturing order
         mo_date = out_date - timedelta(days=self.product_1.produce_delay) - timedelta(days=company.manufacturing_lead)
-        date_planned_start = fields.Datetime.from_string(manufacturing_order.date_planned_start)
+        date_deadline = fields.Datetime.from_string(manufacturing_order.date_deadline)
         self.assertAlmostEqual(
-            date_planned_start, mo_date,
+            date_deadline, mo_date,
             delta=timedelta(seconds=1),
             msg="Schedule date of manufacturing order should be equal to: Schedule date of picking - product's Manufacturing Lead Time - company's Manufacturing Lead Time."
         )
@@ -86,7 +86,7 @@ class TestSaleMrpLeadTime(TestStockCommon):
         self.warehouse_1.write({'delivery_steps': 'pick_pack_ship'})
 
         # Set delay on pull rule
-        for pull_rule in self.warehouse_1.delivery_route_id.pull_ids:
+        for pull_rule in self.warehouse_1.delivery_route_id.rule_ids:
             pull_rule.write({'delay': 2})
 
         # Create sale order of product_1
@@ -116,7 +116,7 @@ class TestSaleMrpLeadTime(TestStockCommon):
         out_date = fields.Datetime.from_string(order.date_order) + timedelta(days=self.product_1.sale_delay) - timedelta(days=out.move_lines[0].rule_id.delay)
         self.assertAlmostEqual(
             out_min_date, out_date,
-            delta=timedelta(seconds=1),
+            delta=timedelta(seconds=10),
             msg='Schedule date of ship type picking should be equal to: order date + Customer Lead Time - pull rule delay.'
         )
 
@@ -126,7 +126,7 @@ class TestSaleMrpLeadTime(TestStockCommon):
         pack_date = out_date - timedelta(days=pack.move_lines[0].rule_id.delay)
         self.assertAlmostEqual(
             pack_min_date, pack_date,
-            delta=timedelta(seconds=1),
+            delta=timedelta(seconds=10),
             msg='Schedule date of pack type picking should be equal to: Schedule date of ship type picking - pull rule delay.'
         )
 
@@ -135,15 +135,15 @@ class TestSaleMrpLeadTime(TestStockCommon):
         pick_min_date = fields.Datetime.from_string(pick.scheduled_date)
         self.assertAlmostEqual(
             pick_min_date, pack_date,
-            delta=timedelta(seconds=1),
+            delta=timedelta(seconds=10),
             msg='Schedule date of pick type picking should be equal to: Schedule date of pack type picking.'
         )
 
         # Check schedule date of manufacturing order
         mo_date = pack_date - timedelta(days=self.product_1.produce_delay)
-        date_planned_start = fields.Datetime.from_string(manufacturing_order.date_planned_start)
+        date_deadline = fields.Datetime.from_string(manufacturing_order.date_deadline)
         self.assertAlmostEqual(
-            date_planned_start, mo_date,
-            delta=timedelta(seconds=1),
+            date_deadline, mo_date,
+            delta=timedelta(seconds=10),
             msg="Schedule date of manufacturing order should be equal to: Schedule date of pack type picking - product's Manufacturing Lead Time."
         )

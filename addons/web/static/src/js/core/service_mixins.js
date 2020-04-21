@@ -20,12 +20,18 @@ var ServiceProviderMixin = {
 
         // add already registered services from the service registry
         _.each(core.serviceRegistry.map, function (Service, serviceName) {
+            if (serviceName in self.UndeployedServices) {
+                throw new Error('Service "' + serviceName + '" is already loaded.');
+            }
             self.UndeployedServices[serviceName] = Service;
         });
         this._deployServices();
 
         // listen on newly added services
         core.serviceRegistry.onAdd(function (serviceName, Service) {
+            if (serviceName in self.services || serviceName in self.UndeployedServices) {
+                throw new Error('Service "' + serviceName + '" is already loaded.');
+            }
             self.UndeployedServices[serviceName] = Service;
             self._deployServices();
         });
@@ -42,15 +48,17 @@ var ServiceProviderMixin = {
         var self = this;
         var done = false;
         while (!done) {
-            var Service = _.find(this.UndeployedServices, function (Service) {
+            var serviceName = _.findKey(this.UndeployedServices, function (Service) {
                 // no missing dependency
                 return !_.some(Service.prototype.dependencies, function (depName) {
                     return !self.services[depName];
                 });
             });
-            if (Service) {
-                this.services[Service.prototype.name] = new Service(this);
-                delete this.UndeployedServices[Service.prototype.name];
+            if (serviceName) {
+                var service = new this.UndeployedServices[serviceName](this);
+                this.services[serviceName] = service;
+                delete this.UndeployedServices[serviceName];
+                service.start();
             } else {
                 done = true;
             }
@@ -116,7 +124,17 @@ var ServicesMixin = {
         return result;
     },
     /**
-     * Builds and executes RPC query. Returns a deferred's promise resolved with
+     * @private
+     * @param {Object} libs - @see ajax.loadLibs
+     * @param {Object} [context] - @see ajax.loadLibs
+     * @param {Object} [tplRoute=this._loadLibsTplRoute] - @see ajax.loadLibs
+     * @returns {Promise}
+     */
+    _loadLibs: function (libs, context, tplRoute) {
+        return this.call('ajax', 'loadLibs', libs, context, tplRoute || this._loadLibsTplRoute);
+    },
+    /**
+     * Builds and executes RPC query. Returns a promise resolved with
      * the RPC result.
      *
      * @param {string} params either a route or a model
@@ -125,33 +143,63 @@ var ServicesMixin = {
      */
     _rpc: function (params, options) {
         var query = rpc.buildQuery(params);
-        var def = this.call('ajax', 'rpc', query.route, query.params, options);
-        return def ? def.promise() : $.Deferred().promise();
+        var prom = this.call('ajax', 'rpc', query.route, query.params, options, this);
+        if (!prom) {
+            prom = new Promise(function () {});
+            prom.abort = function () {};
+        }
+        var abort = prom.abort ? prom.abort : prom.reject;
+        if (!abort) {
+            throw new Error("a rpc promise should always have a reject function");
+        }
+        prom.abort = abort.bind(prom);
+        return prom;
     },
-    loadFieldView: function (dataset, view_id, view_type, options) {
-        return this.loadViews(dataset.model, dataset.get_context().eval(), [[view_id, view_type]], options).then(function (result) {
+    loadFieldView: function (modelName, context, view_id, view_type, options) {
+        return this.loadViews(modelName, context, [[view_id, view_type]], options).then(function (result) {
             return result[view_type];
         });
     },
     loadViews: function (modelName, context, views, options) {
-        var def = $.Deferred();
-        this.trigger_up('load_views', {
-            modelName: modelName,
-            context: context,
-            views: views,
-            options: options,
-            on_success: def.resolve.bind(def),
+        var self = this;
+        return new Promise(function (resolve) {
+            self.trigger_up('load_views', {
+                modelName: modelName,
+                context: context,
+                views: views,
+                options: options,
+                on_success: resolve,
+            });
         });
-        return def;
     },
-    loadFilters: function (dataset, action_id) {
-        var def = $.Deferred();
-        this.trigger_up('load_filters', {
-            dataset: dataset,
-            action_id: action_id,
-            on_success: def.resolve.bind(def),
+    loadFilters: function (modelName, actionId, context) {
+        var self = this;
+        return new Promise(function (resolve, reject) {
+            self.trigger_up('load_filters', {
+                modelName: modelName,
+                actionId: actionId,
+                context: context,
+                on_success: resolve,
+            });
         });
-        return def;
+    },
+    createFilter: function (filter) {
+        var self = this;
+        return new Promise(function (resolve, reject) {
+            self.trigger_up('create_filter', {
+                filter: filter,
+                on_success: resolve,
+            });
+        });
+    },
+    deleteFilter: function (filterId) {
+        var self = this;
+        return new Promise(function (resolve, reject) {
+            self.trigger_up('delete_filter', {
+                filterId: filterId,
+                on_success: resolve,
+            });
+        });
     },
     // Session stuff
     getSession: function () {
@@ -167,28 +215,63 @@ var ServicesMixin = {
      * Informs the action manager to do an action. This supposes that the action
      * manager can be found amongst the ancestors of the current widget.
      * If that's not the case this method will simply return an unresolved
-     * deferred.
+     * promise.
      *
      * @param {any} action
      * @param {any} options
-     * @returns {Deferred}
+     * @returns {Promise}
      */
     do_action: function (action, options) {
-        var def = $.Deferred();
-
-        this.trigger_up('do_action', {
-            action: action,
-            options: options,
-            on_success: function (result) { def.resolve(result); },
-            on_fail: function (result) { def.reject(result); },
+        var self = this;
+        return new Promise(function (resolve, reject) {
+            self.trigger_up('do_action', {
+                action: action,
+                options: options,
+                on_success: resolve,
+                on_fail: reject,
+            });
         });
-        return def;
     },
+    /**
+     * Displays a notification.
+     *
+     * @param {Object} options
+     * @param {string} options.title
+     * @param {string} [options.subtitle]
+     * @param {string} [options.message]
+     * @param {string} [options.type='warning'] 'info', 'success', 'warning', 'danger' or ''
+     * @param {boolean} [options.sticky=false]
+     * @param {string} [options.className]
+     */
+    displayNotification: function (options) {
+        return this.call('notification', 'notify', options);
+    },
+    /**
+     * @deprecated will be removed as soon as the notification system is reviewed
+     * @see displayNotification
+     */
     do_notify: function (title, message, sticky, className) {
-        this.trigger_up('notification', {title: title, message: message, sticky: sticky, className: className});
+        return this.displayNotification({
+            type: 'warning',
+            title: title,
+            message: message,
+            sticky: sticky,
+            className: className,
+        });
     },
+    /**
+     * @deprecated will be removed as soon as the notification system is reviewed
+     * @see displayNotification
+     */
     do_warn: function (title, message, sticky, className) {
-        this.trigger_up('warning', {title: title, message: message, sticky: sticky, className: className});
+        console.warn(title, message);
+        return this.displayNotification({
+            type: 'danger',
+            title: title,
+            message: message,
+            sticky: sticky,
+            className: className,
+        });
     },
 };
 

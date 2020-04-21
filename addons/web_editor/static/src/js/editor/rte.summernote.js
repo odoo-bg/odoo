@@ -1,25 +1,24 @@
 odoo.define('web_editor.rte.summernote', function (require) {
 'use strict';
 
-var ajax = require('web.ajax');
 var Class = require('web.Class');
+const concurrency = require('web.concurrency');
 var core = require('web.core');
+// Use the top window's core.bus for dialog events so that they take the whole window
+// instead of being confined to an iframe. This means that the event triggered on
+// the bus by summernote in an iframe will be caught by the wysiwyg's SummernoteManager
+// outside the iframe.
+const topBus = window.top.odoo.__DEBUG__.services['web.core'].bus;
+const ColorpickerDialog = require('web.ColorpickerDialog');
+var ColorPaletteWidget = require('web_editor.ColorPalette').ColorPaletteWidget;
 var mixins = require('web.mixins');
-var base = require('web_editor.base');
-var weContext = require('web_editor.context');
+const session = require('web.session');
+var fonts = require('wysiwyg.fonts');
 var rte = require('web_editor.rte');
-var weWidgets = require('web_editor.widget');
+var ServicesMixin = require('web.ServicesMixin');
+var weWidgets = require('wysiwyg.widgets');
 
-var QWeb = core.qweb;
 var _t = core._t;
-
-ajax.jsonRpc('/web/dataset/call', 'call', {
-    'model': 'ir.ui.view',
-    'method': 'read_template',
-    'args': ['web_editor.colorpicker', weContext.get()]
-}).done(function (data) {
-    QWeb.add_template(data);
-});
 
 // Summernote Lib (neek change to make accessible: method and object)
 var dom = $.summernote.core.dom;
@@ -31,49 +30,57 @@ var tplButton = renderer.getTemplate().button;
 var tplIconButton = renderer.getTemplate().iconButton;
 var tplDropdown = renderer.getTemplate().dropdown;
 
+var applyColor = function (target, eventName, color) {
+    var layoutInfo = dom.makeLayoutInfo(target);
+    $.summernote.pluginEvents[eventName](undefined, eventHandler.modules.editor, layoutInfo, color);
+};
+
 // Update and change the popovers content, and add history button
-var fn_createPalette = renderer.createPalette;
 renderer.createPalette = function ($container, options) {
-    fn_createPalette.call(this, $container, options);
+    const $dropdownContent = $container.find(".colorPalette");
+    // The editor's root widget can be website or web's root widget and cannot be properly retrieved...
+    const parent = odoo.__DEBUG__.services['root.widget'];
+    _.each($dropdownContent, elem => {
+        const eventName = elem.dataset.eventName;
+        let colorpicker = null;
+        const mutex = new concurrency.MutexedDropPrevious();
+        const $dropdown = $(elem).closest('.btn-group, .dropdown');
+        let manualOpening = false;
+        $dropdown.on('show.bs.dropdown', () => {
+            if (manualOpening) {
+                return true;
+            }
+            mutex.exec(() => {
+                const oldColorpicker = colorpicker;
+                const hookEl = oldColorpicker ? oldColorpicker.el : elem;
 
-    if (!QWeb.has_template('web_editor.colorpicker')) {
-        return;
-    }
-
-    var $clpicker = $(QWeb.render('web_editor.colorpicker'));
-
-    var groups;
-    if ($clpicker.is("colorpicker")) {
-        groups = _.map($clpicker.children(), function (el) {
-            return $(el).find("button").empty();
+                const r = range.create();
+                const targetNode = r.sc;
+                const targetElement = targetNode.nodeType === Node.ELEMENT_NODE ? targetNode : targetNode.parentNode;
+                colorpicker = new ColorPaletteWidget(parent, {
+                    excluded: ['transparent_grayscale'],
+                    $editable: rte.Class.prototype.editable(), // Our parent is the root widget, we can't retrieve the editable section from it...
+                    selectedColor: $(targetElement).css(eventName === "foreColor" ? 'color' : 'backgroundColor'),
+                });
+                colorpicker.on('color_picked', null, ev => {
+                    let color = ev.data.color;
+                    if (!ColorpickerDialog.isCSSColor(color)) {
+                        color = (eventName === "foreColor" ? 'text-' : 'bg-') + color;
+                    }
+                    applyColor(ev.data.target, eventName, color);
+                });
+                colorpicker.on('color_reset', null, ev => applyColor(ev.data.target, eventName, 'inherit'));
+                return colorpicker.replace(hookEl).then(() => {
+                    if (oldColorpicker) {
+                        oldColorpicker.destroy();
+                    }
+                    manualOpening = true;
+                    $dropdown.children('.dropdown-toggle').dropdown('show');
+                    manualOpening = false;
+                });
+            });
+            return false;
         });
-    } else {
-        groups = [$clpicker.find("button").empty()];
-    }
-
-    var html = "<h6>" + _t("Theme colors") + "</h6>" + _.map(groups, function ($group) {
-        var $row = $("<div/>", {"class": "note-color-row mb8"}).append($group);
-        var $after_breaks = $row.find(".o_small + :not(.o_small)");
-        if ($after_breaks.length === 0) {
-            $after_breaks = $row.find(":nth-child(8n+9)");
-        }
-        $after_breaks.addClass("o_clear");
-        return $row[0].outerHTML;
-    }).join("") + "<h6>" + _t("Common colors") + "</h6>";
-    var $palettes = $container.find(".note-color .note-color-palette");
-    $palettes.prepend(html);
-
-    var $bg = $palettes.filter(":even").find("button:not(.note-color-btn)").addClass("note-color-btn");
-    var $fore = $palettes.filter(":odd").find("button:not(.note-color-btn)").addClass("note-color-btn");
-    $bg.each(function () {
-        var $el = $(this);
-        var className = 'bg-' + $el.data('color');
-        $el.attr('data-event', 'backColor').attr('data-value', className).addClass(className);
-    });
-    $fore.each(function () {
-        var $el = $(this);
-        var className = 'text-' + $el.data('color');
-        $el.attr('data-event', 'foreColor').attr('data-value', className).addClass('bg-' + $el.data('color'));
     });
 };
 
@@ -84,10 +91,6 @@ renderer.tplPopovers = function (lang, options) {
     var $imagePopover = $popover.find('.note-image-popover');
     var $linkPopover = $popover.find('.note-link-popover');
     var $airPopover = $popover.find('.note-air-popover');
-
-    if (window === window.top) {
-        $popover.children().addClass("hidden-xs");
-    }
 
     //////////////// image popover
 
@@ -104,11 +107,11 @@ renderer.tplPopovers = function (lang, options) {
     var $padding = $('<div class="btn-group"/>');
     $padding.insertBefore($imagePopover.find('.btn-group:first'));
     var dropdown_content = [
-        '<li><a data-event="padding" href="#" data-value="">'+_t('None')+'</a></li>',
-        '<li><a data-event="padding" href="#" data-value="small">'+_t('Small')+'</a></li>',
-        '<li><a data-event="padding" href="#" data-value="medium">'+_t('Medium')+'</a></li>',
-        '<li><a data-event="padding" href="#" data-value="large">'+_t('Large')+'</a></li>',
-        '<li><a data-event="padding" href="#" data-value="xl">'+_t('Xl')+'</a></li>',
+        '<li><a class="dropdown-item" data-event="padding" href="#" data-value="">'+_t('None')+'</a></li>',
+        '<li><a class="dropdown-item" data-event="padding" href="#" data-value="small">'+_t('Small')+'</a></li>',
+        '<li><a class="dropdown-item" data-event="padding" href="#" data-value="medium">'+_t('Medium')+'</a></li>',
+        '<li><a class="dropdown-item" data-event="padding" href="#" data-value="large">'+_t('Large')+'</a></li>',
+        '<li><a class="dropdown-item" data-event="padding" href="#" data-value="xl">'+_t('Xl')+'</a></li>',
     ];
     $(tplIconButton('fa fa-plus-square-o', {
         title: _t('Padding'),
@@ -121,10 +124,10 @@ renderer.tplPopovers = function (lang, options) {
         title: _t('Shadow'),
         event: 'imageShape',
         value: 'shadow'
-    })).insertAfter($imagePopover.find('[data-event="imageShape"][data-value="img-circle"]'));
+    })).insertAfter($imagePopover.find('[data-event="imageShape"][data-value="rounded-circle"]'));
 
     // add spin for fa
-    var $spin = $('<div class="btn-group hidden only_fa"/>').insertAfter($button.parent());
+    var $spin = $('<div class="btn-group d-none only_fa"/>').insertAfter($button.parent());
     $(tplIconButton('fa fa-refresh', {
             title: _t('Spin'),
             event: 'imageShape',
@@ -132,7 +135,7 @@ renderer.tplPopovers = function (lang, options) {
         })).appendTo($spin);
 
     // resize for fa
-    var $resizefa = $('<div class="btn-group hidden only_fa"/>')
+    var $resizefa = $('<div class="btn-group d-none only_fa"/>')
         .insertAfter($imagePopover.find('.btn-group:has([data-event="resize"])'));
     for (var size=1; size<=5; size++) {
         $(tplButton('<span class="note-fontsize-10">'+size+'x</span>', {
@@ -142,12 +145,12 @@ renderer.tplPopovers = function (lang, options) {
         })).appendTo($resizefa);
     }
     var $colorfa = $airPopover.find('.note-color').clone();
-    $colorfa.find("ul.dropdown-menu").css('min-width', '172px');
+    $colorfa.find(".dropdown-menu").css('min-width', '172px');
     $resizefa.after($colorfa);
 
     // show dialog box and delete
     var $imageprop = $('<div class="btn-group"/>');
-    $imageprop.appendTo($imagePopover.find('.popover-content'));
+    $imageprop.appendTo($imagePopover.find('.popover-body'));
     $(tplIconButton('fa fa-file-image-o', {
             title: _t('Edit'),
             event: 'showImageDialog'
@@ -157,17 +160,22 @@ renderer.tplPopovers = function (lang, options) {
             event: 'delete'
         })).appendTo($imageprop);
 
-    $imagePopover.find('.popover-content').append($airPopover.find(".note-history").clone());
+    $(tplIconButton('fa fa-crop', {
+        title: _t('Crop Image'),
+        event: 'cropImage',
+    })).insertAfter($imagePopover.find('[data-event="imageShape"][data-value="img-thumbnail"]'));
+
+    $imagePopover.find('.popover-body').append($airPopover.find(".note-history").clone());
 
     $imagePopover.find('[data-event="showImageDialog"]').before($airPopover.find('[data-event="showLinkDialog"]').clone());
 
     var $alt = $('<div class="btn-group"/>');
-    $alt.appendTo($imagePopover.find('.popover-content'));
-    $alt.append('<button class="btn btn-default btn-sm btn-small" data-event="alt"><strong>' + _t('Description') + ': </strong><span class="o_image_alt"/></button>');
+    $alt.appendTo($imagePopover.find('.popover-body'));
+    $alt.append('<button class="btn btn-secondary" data-event="alt"><strong>' + _t('Description') + ': </strong><span class="o_image_alt"/></button>');
 
     //////////////// link popover
 
-    $linkPopover.find('.popover-content').append($airPopover.find(".note-history").clone());
+    $linkPopover.find('.popover-body').append($airPopover.find(".note-history").clone());
 
     $linkPopover.find('button[data-event="showLinkDialog"] i').attr("class", "fa fa-link");
     $linkPopover.find('button[data-event="unlink"]').before($airPopover.find('button[data-event="showImageDialog"]').clone());
@@ -182,16 +190,16 @@ renderer.tplPopovers = function (lang, options) {
         while (node && (!node.tagName || (!node.tagName || formats.indexOf(node.tagName.toLowerCase()) === -1))) {
             node = node.parentNode;
         }
-        $format.parent().removeClass('active');
+        $format.removeClass('active');
         $format.filter('[data-value="'+(node ? node.tagName.toLowerCase() : "p")+'"]')
-            .parent().addClass("active");
+            .addClass("active");
     });
 
     //////////////// tooltip
 
     setTimeout(function () {
         $airPopover.add($linkPopover).add($imagePopover).find("button")
-            .tooltip('destroy')
+            .tooltip('dispose')
             .tooltip({
                 container: 'body',
                 trigger: 'hover',
@@ -207,27 +215,33 @@ eventHandler.modules.popover.button.update = function ($container, oStyle) {
     // stop animation when edit content
     var previous = $(".note-control-selection").data('target');
     if (previous) {
-        $(previous).css({"-webkit-animation-play-state": "", "animation-play-state": "", "-webkit-transition": "", "transition": "", "-webkit-animation": "", "animation": ""});
+        var $previous = $(previous);
+        $previous.css({"-webkit-animation-play-state": "", "animation-play-state": "", "-webkit-transition": "", "transition": "", "-webkit-animation": "", "animation": ""});
+        $previous.find('.o_we_selected_image').addBack('.o_we_selected_image').removeClass('o_we_selected_image');
     }
     // end
 
     fn_boutton_update.call(this, $container, oStyle);
 
-    $container.find('.note-color').removeClass("hidden");
+    $container.find('.note-color').removeClass('d-none');
 
     if (oStyle.image) {
-        $container.find('[data-event]').parent().removeClass("active");
+        $container.find('[data-event]').removeClass("active");
 
-        $container.find('a[data-event="padding"][data-value="small"]').parent().toggleClass("active", $(oStyle.image).hasClass("padding-small"));
-        $container.find('a[data-event="padding"][data-value="medium"]').parent().toggleClass("active", $(oStyle.image).hasClass("padding-medium"));
-        $container.find('a[data-event="padding"][data-value="large"]').parent().toggleClass("active", $(oStyle.image).hasClass("padding-large"));
-        $container.find('a[data-event="padding"][data-value="xl"]').parent().toggleClass("active", $(oStyle.image).hasClass("padding-xl"));
-        $container.find('a[data-event="padding"][data-value=""]').parent().toggleClass("active", !$container.find('.active a[data-event="padding"]').length);
+        $container.find('a[data-event="padding"][data-value="small"]').toggleClass("active", $(oStyle.image).hasClass("padding-small"));
+        $container.find('a[data-event="padding"][data-value="medium"]').toggleClass("active", $(oStyle.image).hasClass("padding-medium"));
+        $container.find('a[data-event="padding"][data-value="large"]').toggleClass("active", $(oStyle.image).hasClass("padding-large"));
+        $container.find('a[data-event="padding"][data-value="xl"]').toggleClass("active", $(oStyle.image).hasClass("padding-xl"));
+        $container.find('a[data-event="padding"][data-value=""]').toggleClass("active", !$container.find('li a.active[data-event="padding"]').length);
+
+        $(oStyle.image).addClass('o_we_selected_image');
 
         if (dom.isImgFont(oStyle.image)) {
+            $container.find('.note-fore-color-preview > button').css('border-bottom-color', $(oStyle.image).css('color'));
+            $container.find('.note-back-color-preview > button').css('border-bottom-color', $(oStyle.image).css('background-color'));
 
-            $container.find('.btn-group:not(.only_fa):has(button[data-event="resize"],button[data-value="img-thumbnail"])').addClass("hidden");
-            $container.find('.only_fa').removeClass("hidden");
+            $container.find('.btn-group:not(.only_fa):has(button[data-event="resize"],button[data-value="img-thumbnail"])').addClass('d-none');
+            $container.find('.only_fa').removeClass('d-none');
             $container.find('button[data-event="resizefa"][data-value="2"]').toggleClass("active", $(oStyle.image).hasClass("fa-2x"));
             $container.find('button[data-event="resizefa"][data-value="3"]').toggleClass("active", $(oStyle.image).hasClass("fa-3x"));
             $container.find('button[data-event="resizefa"][data-value="4"]').toggleClass("active", $(oStyle.image).hasClass("fa-4x"));
@@ -236,11 +250,11 @@ eventHandler.modules.popover.button.update = function ($container, oStyle) {
 
             $container.find('button[data-event="imageShape"][data-value="fa-spin"]').toggleClass("active", $(oStyle.image).hasClass("fa-spin"));
             $container.find('button[data-event="imageShape"][data-value="shadow"]').toggleClass("active", $(oStyle.image).hasClass("shadow"));
+            $container.find('.btn-group:has(button[data-event="imageShape"])').removeClass("d-none");
 
         } else {
-
-            $container.find('.hidden:not(.only_fa)').removeClass("hidden");
-            $container.find('.only_fa').addClass("hidden");
+            $container.find('.d-none:not(.only_fa, .note-recent-color)').removeClass('d-none');
+            $container.find('.only_fa').addClass('d-none');
             var width = ($(oStyle.image).attr('style') || '').match(/(^|;|\s)width:\s*([0-9]+%)/);
             if (width) {
                 width = width[2];
@@ -253,19 +267,30 @@ eventHandler.modules.popover.button.update = function ($container, oStyle) {
             $container.find('button[data-event="imageShape"][data-value="shadow"]').toggleClass("active", $(oStyle.image).hasClass("shadow"));
 
             if (!$(oStyle.image).is("img")) {
-                $container.find('.btn-group:has(button[data-event="imageShape"])').addClass("hidden");
+                $container.find('.btn-group:has(button[data-event="imageShape"])').addClass('d-none');
             }
 
-            $container.find('.note-color').addClass("hidden");
-
+            $container.find('.note-color').addClass('d-none');
         }
 
-        $container.find('button[data-event="floatMe"][data-value="left"]').toggleClass("active", $(oStyle.image).hasClass("pull-left"));
-        $container.find('button[data-event="floatMe"][data-value="center"]').toggleClass("active", $(oStyle.image).hasClass("center-block"));
-        $container.find('button[data-event="floatMe"][data-value="right"]').toggleClass("active", $(oStyle.image).hasClass("pull-right"));
+        $container.find('button[data-event="floatMe"][data-value="left"]').toggleClass("active", $(oStyle.image).hasClass("float-left"));
+        $container.find('button[data-event="floatMe"][data-value="center"]').toggleClass("active", $(oStyle.image).hasClass("d-block mx-auto"));
+        $container.find('button[data-event="floatMe"][data-value="right"]').toggleClass("active", $(oStyle.image).hasClass("float-right"));
 
         $(oStyle.image).trigger('attributes_change');
+    } else {
+        $container.find('.note-fore-color-preview > button').css('border-bottom-color', oStyle.color);
+        $container.find('.note-back-color-preview > button').css('border-bottom-color', oStyle['background-color']);
     }
+};
+
+var fn_toolbar_boutton_update = eventHandler.modules.toolbar.button.update;
+eventHandler.modules.toolbar.button.update = function ($container, oStyle) {
+    fn_toolbar_boutton_update.call(this, $container, oStyle);
+
+    $container.find('button[data-event="insertUnorderedList"]').toggleClass("active", $(oStyle.ancestors).is('ul:not(.o_checklist)'));
+    $container.find('button[data-event="insertOrderedList"]').toggleClass("active", $(oStyle.ancestors).is('ol'));
+    $container.find('button[data-event="insertCheckList"]').toggleClass("active", $(oStyle.ancestors).is('ul.o_checklist'));
 };
 
 var fn_popover_update = eventHandler.modules.popover.update;
@@ -354,9 +379,9 @@ eventHandler.modules.editor.floatMe = function ($editable, sValue) {
     var $target = $(getImgTarget($editable));
     $editable.data('NoteHistory').recordUndo();
     switch (sValue) {
-        case 'center': $target.toggleClass('center-block').removeClass('pull-right pull-left'); break;
-        case 'left': $target.toggleClass('pull-left').removeClass('pull-right center-block'); break;
-        case 'right': $target.toggleClass('pull-right').removeClass('pull-left center-block'); break;
+        case 'center': $target.toggleClass('d-block mx-auto').removeClass('float-right float-left'); break;
+        case 'left': $target.toggleClass('float-left').removeClass('float-right d-block mx-auto'); break;
+        case 'right': $target.toggleClass('float-right').removeClass('float-left d-block mx-auto'); break;
     }
 };
 eventHandler.modules.editor.imageShape = function ($editable, sValue) {
@@ -369,8 +394,14 @@ eventHandler.modules.linkDialog.showLinkDialog = function ($editable, $dialog, l
     $editable.data('range').select();
     $editable.data('NoteHistory').recordUndo();
 
+    var commonAncestor = linkInfo.range.commonAncestor();
+    if (commonAncestor && commonAncestor.closest) {
+        var link = commonAncestor.closest('a');
+        linkInfo.className = link && link.className;
+    }
+
     var def = new $.Deferred();
-    core.bus.trigger('link_dialog_demand', {
+    topBus.trigger('link_dialog_demand', {
         $editable: $editable,
         linkInfo: linkInfo,
         onSave: function (linkInfo) {
@@ -392,11 +423,19 @@ eventHandler.modules.imageDialog.showImageDialog = function ($editable) {
     var media = $(r.sc).parents().addBack().filter(function (i, el) {
         return dom.isImg(el);
     })[0];
-    core.bus.trigger('media_dialog_demand', {
+    topBus.trigger('media_dialog_demand', {
         $editable: $editable,
         media: media,
         options: {
-            lastFilters: ['background'],
+            onUpload: $editable.data('callbacks').onUpload,
+            noVideos:
+              $editable.data('oe-model') === "mail.compose.message" ||
+              ($editable.data('options') && $editable.data('options').noVideos),
+        },
+        onSave: function (media) {
+            if(!document.body.contains(media)) {
+            r.insertNode(media);
+            };
         },
     });
     return new $.Deferred().reject();
@@ -404,7 +443,15 @@ eventHandler.modules.imageDialog.showImageDialog = function ($editable) {
 $.summernote.pluginEvents.alt = function (event, editor, layoutInfo, sorted) {
     var $editable = layoutInfo.editable();
     var $selection = layoutInfo.handle().find('.note-control-selection');
-    core.bus.trigger('alt_dialog_demand', {
+    topBus.trigger('alt_dialog_demand', {
+        $editable: $editable,
+        media: $selection.data('target'),
+    });
+};
+$.summernote.pluginEvents.cropImage = function (event, editor, layoutInfo, sorted) {
+    var $editable = layoutInfo.editable();
+    var $selection = layoutInfo.handle().find('.note-control-selection');
+    topBus.trigger('crop_image_dialog_demand', {
         $editable: $editable,
         media: $selection.data('target'),
     });
@@ -434,8 +481,8 @@ dom.isImgFont = function (node) {
     var className = (node && node.className || "");
     if (node && (nodeName === "SPAN" || nodeName === "I") && className.length) {
         var classNames = className.split(/\s+/);
-        for (var k=0; k<base.fontIcons.length; k++) {
-            if (_.intersection(base.fontIcons[k].alias, classNames).length) {
+        for (var k=0; k<fonts.fontIcons.length; k++) {
+            if (_.intersection(fonts.fontIcons[k].alias, classNames).length) {
                 return true;
             }
         }
@@ -473,7 +520,7 @@ function prettify_html(html) {
             while (i--) space += '  ';
             return space;
         },
-        reg = /^<\/?(a|span|font|strong|u|i|strong|b)(\s|>)/i,
+        reg = /^<\/?(a|span|font|u|em|i|strong|b)(\s|>)/i,
         inline_level = Infinity,
         tokens = _.compact(_.flatten(_.map(html.split(/</), function (value) {
             value = value.replace(/\s+/g, ' ').split(/>/);
@@ -535,7 +582,7 @@ function prettify_html(html) {
  *   disable (false) or enable (true) the code view mode.
  */
 $.summernote.pluginEvents.codeview = function (event, editor, layoutInfo, enable) {
-    if (layoutInfo === undefined) {
+    if (!layoutInfo) {
         return;
     }
     if (layoutInfo.toolbar) {
@@ -664,9 +711,17 @@ function summernote_mousedown(event) {
     }
 
     // restore range if range lost after clicking on non-editable area
-    r = range.create();
+    try {
+        r = range.create();
+    } catch (e) {
+        // If this code is running inside an iframe-editor and that the range
+        // is outside of this iframe, this will fail as the iframe does not have
+        // the permission to check the outside content this way. In that case,
+        // we simply ignore the exception as it is as if there was no range.
+        return;
+    }
     var editables = $(".o_editable[contenteditable], .note-editable[contenteditable]");
-    var r_editable = editables.has((r||{}).sc);
+    var r_editable = editables.has((r||{}).sc).addBack(editables.filter((r||{}).sc));
     if (!r_editable.closest('.note-editor').is($editable) && !r_editable.filter('.o_editable').is(editables)) {
         var saved_editable = editables.has((remember_selection||{}).sc);
         if ($editable.length && !saved_editable.closest('.o_editable, .note-editor').is($editable)) {
@@ -775,11 +830,6 @@ eventHandler.attach = function (oLayoutInfo, options) {
         eventHandler.modules.linkDialog.show(oLayoutInfo);
     });
 
-    if (oLayoutInfo.editor().is('[data-oe-model][data-oe-type="image"]')) {
-        oLayoutInfo.editor().on('click', 'img', function (event) {
-            $(event.target).trigger("dblclick");
-        });
-    }
     oLayoutInfo.editable().on('mousedown', function (e) {
         if (dom.isImg(e.target) && dom.isContentEditable(e.target)) {
             range.createFromNode(e.target).select();
@@ -788,6 +838,14 @@ eventHandler.attach = function (oLayoutInfo, options) {
     $(document).on("keyup", reRangeSelectKey);
 
     var clone_data = false;
+
+    if (options.model) {
+        oLayoutInfo.editable().data({'oe-model': options.model, 'oe-id': options.id});
+    }
+    if (options.getMediaDomain) {
+        oLayoutInfo.editable().data('oe-media-domain', options.getMediaDomain);
+    }
+
     var $node = oLayoutInfo.editor();
     if ($node.data('oe-model') || $node.data('oe-translation-id')) {
         $node.on('content_changed', function () {
@@ -866,10 +924,13 @@ eventHandler.attach = function (oLayoutInfo, options) {
 
             show_tooltip = true;
             setTimeout(function () {
-                if (!show_tooltip) return;
+                // Do not show tooltip on double-click and if there is already one
+                if (!show_tooltip || $target.attr('title') !== undefined) {
+                    return;
+                }
                 $target.tooltip({title: _t('Double-click to edit'), trigger: 'manuel', container: 'body'}).tooltip('show');
                 setTimeout(function () {
-                    $target.tooltip('destroy');
+                    $target.tooltip('dispose');
                 }, 800);
             }, 400);
         });
@@ -942,6 +1003,7 @@ $.summernote.lang.odoo = {
       normal: _t('Normal'),
       blockquote: _t('Quote'),
       pre: _t('Code'),
+      small: _t('Small'),
       h1: _t('Header 1'),
       h2: _t('Header 2'),
       h3: _t('Header 3'),
@@ -968,14 +1030,11 @@ $.summernote.lang.odoo = {
       justify: _t('Justify full')
     },
     color: {
-      recent: _t('Recent Color'),
-      more: _t('More Color'),
+      custom: _t('Custom Color'),
       background: _t('Background Color'),
       foreground: _t('Font Color'),
       transparent: _t('Transparent'),
-      setTransparent: _t('Set transparent'),
-      reset: _t('Reset'),
-      resetToDefault: _t('Reset to default')
+      setTransparent: _t('None'),
     },
     shortcut: {
       shortcuts: _t('Keyboard shortcuts'),
@@ -998,7 +1057,7 @@ $.summernote.lang.odoo = {
  * instantiate media, link and alt dialogs outside the main editor: in the
  * simple HTML fields and forum textarea.
  */
-var SummernoteManager = Class.extend(mixins.EventDispatcherMixin, {
+var SummernoteManager = Class.extend(mixins.EventDispatcherMixin, ServicesMixin, {
     /**
      * @constructor
      */
@@ -1006,9 +1065,10 @@ var SummernoteManager = Class.extend(mixins.EventDispatcherMixin, {
         mixins.EventDispatcherMixin.init.call(this);
         this.setParent(parent);
 
-        core.bus.on('alt_dialog_demand', this, this._onAltDialogDemand);
-        core.bus.on('link_dialog_demand', this, this._onLinkDialogDemand);
-        core.bus.on('media_dialog_demand', this, this._onMediaDialogDemand);
+        topBus.on('alt_dialog_demand', this, this._onAltDialogDemand);
+        topBus.on('crop_image_dialog_demand', this, this._onCropImageDialogDemand);
+        topBus.on('link_dialog_demand', this, this._onLinkDialogDemand);
+        topBus.on('media_dialog_demand', this, this._onMediaDialogDemand);
     },
     /**
      * @override
@@ -1016,9 +1076,60 @@ var SummernoteManager = Class.extend(mixins.EventDispatcherMixin, {
     destroy: function () {
         mixins.EventDispatcherMixin.destroy.call(this);
 
-        core.bus.off('alt_dialog_demand', this, this._onAltDialogDemand);
-        core.bus.off('link_dialog_demand', this, this._onLinkDialogDemand);
-        core.bus.off('media_dialog_demand', this, this._onMediaDialogDemand);
+        topBus.off('alt_dialog_demand', this, this._onAltDialogDemand);
+        topBus.off('crop_image_dialog_demand', this, this._onCropImageDialogDemand);
+        topBus.off('link_dialog_demand', this, this._onLinkDialogDemand);
+        topBus.off('media_dialog_demand', this, this._onMediaDialogDemand);
+    },
+
+    /**
+     * Create/Update cropped attachments.
+     *
+     * @param {jQuery} $editable
+     * @returns {Promise}
+     */
+    saveCroppedImages: function ($editable) {
+        var defs = _.map($editable.find('.o_cropped_img_to_save'), async croppedImg => {
+            var $croppedImg = $(croppedImg);
+            $croppedImg.removeClass('o_cropped_img_to_save');
+
+            var resModel = $croppedImg.data('crop:resModel');
+            var resID = $croppedImg.data('crop:resID');
+            var cropID = $croppedImg.data('crop:id');
+            var mimetype = $croppedImg.data('crop:mimetype');
+            var originalSrc = $croppedImg.data('crop:originalSrc');
+
+            var datas = $croppedImg.attr('src').split(',')[1];
+            let attachmentID = cropID;
+            if (!cropID) {
+                var name = originalSrc + '.crop';
+                attachmentID = await this._rpc({
+                    model: 'ir.attachment',
+                    method: 'create',
+                    args: [{
+                        res_model: resModel,
+                        res_id: resID,
+                        name: name,
+                        datas: datas,
+                        mimetype: mimetype,
+                        url: originalSrc, // To save the original image that was cropped
+                    }],
+                });
+            } else {
+                await this._rpc({
+                    model: 'ir.attachment',
+                    method: 'write',
+                    args: [[cropID], {datas: datas}],
+                });
+            }
+            const access_token = await this._rpc({
+                model: 'ir.attachment',
+                method: 'generate_access_token',
+                args: [[attachmentID]],
+            });
+            $croppedImg.attr('src', '/web/image/' + attachmentID + '?access_token=' + access_token[0]);
+        });
+        return Promise.all(defs);
     },
 
     //--------------------------------------------------------------------------
@@ -1038,7 +1149,6 @@ var SummernoteManager = Class.extend(mixins.EventDispatcherMixin, {
         data.__alreadyDone = true;
         var altDialog = new weWidgets.AltDialog(this,
             data.options || {},
-            data.$editable,
             data.media
         );
         if (data.onSave) {
@@ -1048,6 +1158,32 @@ var SummernoteManager = Class.extend(mixins.EventDispatcherMixin, {
             altDialog.on('cancel', this, data.onCancel);
         }
         altDialog.open();
+    },
+    /**
+     * Called when a demand to open a crop dialog is received on the bus.
+     *
+     * @private
+     * @param {Object} data
+     */
+    _onCropImageDialogDemand: function (data) {
+        if (data.__alreadyDone) {
+            return;
+        }
+        data.__alreadyDone = true;
+        var cropImageDialog = new weWidgets.CropImageDialog(this,
+            _.extend({
+                res_model: data.$editable.data('oe-model'),
+                res_id: data.$editable.data('oe-id'),
+            }, data.options || {}),
+            data.media
+        );
+        if (data.onSave) {
+            cropImageDialog.on('save', this, data.onSave);
+        }
+        if (data.onCancel) {
+            cropImageDialog.on('cancel', this, data.onCancel);
+        }
+        cropImageDialog.open();
     },
     /**
      * Called when a demand to open a link dialog is received on the bus.
@@ -1089,8 +1225,8 @@ var SummernoteManager = Class.extend(mixins.EventDispatcherMixin, {
             _.extend({
                 res_model: data.$editable.data('oe-model'),
                 res_id: data.$editable.data('oe-id'),
+                domain: data.$editable.data('oe-media-domain'),
             }, data.options),
-            data.$editable,
             data.media
         );
         if (data.onSave) {
@@ -1100,26 +1236,6 @@ var SummernoteManager = Class.extend(mixins.EventDispatcherMixin, {
             mediaDialog.on('cancel', this, data.onCancel);
         }
         mediaDialog.open();
-    },
-});
-/**
- * @todo cannot do this without include because it would make a loop in the
- * JS module dependencies otherwise.
- */
-rte.Class.include({
-    /**
-     * @override
-     */
-    start: function () {
-        this._summernoteManager = new SummernoteManager(this);
-        return this._super.apply(this, arguments);
-    },
-    /**
-     * @override
-     */
-    cancel: function () {
-        this._super.apply(this, arguments);
-        this._summernoteManager.destroy();
     },
 });
 return SummernoteManager;

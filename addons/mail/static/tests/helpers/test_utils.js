@@ -1,13 +1,21 @@
 odoo.define('mail.testUtils', function (require) {
 "use strict";
 
-var Discuss = require('mail.chat_discuss');
+var BusService = require('bus.BusService');
 
-var AbstractService = require('web.AbstractService');
-var Bus = require('web.Bus');
+var Discuss = require('mail.Discuss');
+var MailService = require('mail.Service');
+var mailUtils = require('mail.utils');
+
+var AbstractStorageService = require('web.AbstractStorageService');
+var Class = require('web.Class');
+const dom = require('web.dom');
+var RamStorage = require('web.RamStorage');
+const makeTestEnvironment = require('web.test_env');
 var testUtils = require('web.test_utils');
 var Widget = require('web.Widget');
 
+const { prepareTarget } = testUtils;
 /**
  * Test Utils
  *
@@ -16,68 +24,197 @@ var Widget = require('web.Widget');
  */
 
 /**
- * Create a mock bus_service, using 'bus' instead of bus.bus
+ * Create asynchronously a discuss widget.
+ * This is async due to mail_manager/mail_service that needs to be ready.
  *
- * @param {web.bus} bus
- * @return {AbstractService} the mock bus_service
+ * @param {Object} params
+ * @returns {Promise<Discuss>}
  */
-function createBusService(bus) {
-    var BusService =  AbstractService.extend({
-        name: 'bus_service',
-        /**
-         * @override
-         */
-        init: function () {
-            this._super.apply(this, arguments);
-            if (!bus) {
-                bus = new Bus();
-            }
-            this.bus = new _.extend(bus, {
-                /**
-                 * Do nothing
-                 */
-                start_polling: function () {},
-            });
-        },
-
-        //--------------------------------------------------------------------------
-        // Public
-        //--------------------------------------------------------------------------
-
-        /**
-         * Get the bus
-         */
-        getBus: function () {
-            return this.bus;
-        },
-    });
-
-    return BusService;
-}
-
-function createDiscuss(params) {
-    var Parent = Widget.extend({
+async function createDiscuss(params) {
+    const target = prepareTarget(params.debug);
+    const Parent = Widget.extend({
         do_push_state: function () {},
     });
-    var parent = new Parent();
-    testUtils.addMockEnvironment(parent, {
-        data: params.data,
-        archs: {
-            'mail.message,false,search': '<search/>',
-        },
-        mockRPC: params.mockRPC,
-        services: params.services,
-    });
-    var discuss = new Discuss(parent, params);
-    discuss.set_cp_bus(new Widget());
-    discuss.appendTo($('#qunit-fixture'));
+    const parent = new Parent();
+    params.archs = params.archs || {
+        'mail.message,false,search': '<search/>',
+    };
+    await testUtils.mock.addMockEnvironment(parent, params);
 
+    const env = params.env || {};
+    owl.Component.env = makeTestEnvironment(env);
+
+    const discuss = new Discuss(parent, params);
+
+    // override 'destroy' of discuss so that it calls 'destroy' on the parent
+    // instead, which is the parent of discuss and the mockServer.
+    const _destroy = discuss.destroy;
+    discuss.destroy = function () {
+        // remove the override to properly destroy discuss and its children
+        // when it will be called the second time (by its parent)
+        discuss.destroy = _destroy;
+        discuss.on_detach_callback();
+        parent.destroy();
+    };
+
+    const fragment = document.createDocumentFragment();
+    await discuss.appendTo(fragment);
+    dom.prepend(target, fragment, {
+        callbacks: [{ widget: discuss }],
+        in_DOM: true,
+    });
     return discuss;
 }
 
+
+var MockMailService = Class.extend({
+    bus_service: function () {
+        return BusService.extend({
+            _poll: function () {}, // Do nothing
+            _registerWindowUnload: function () {}, // Do nothing
+            isOdooFocused: function () { return true; },
+            updateOption: function () {},
+        });
+    },
+    mail_service: function () {
+        return MailService;
+    },
+    local_storage: function () {
+        return AbstractStorageService.extend({
+            storage: new RamStorage(),
+        });
+    },
+    getServices: function () {
+        return {
+            mail_service: this.mail_service(),
+            bus_service: this.bus_service(),
+            local_storage: this.local_storage(),
+        };
+    },
+});
+
+/**
+ * Patch all the mailUtils.clearTimeout and mailUtils.setTimeout.
+ *
+ * @return {Object} helper functions, including unpatch and time management tools.
+ */
+var patchMailTimeouts = function () {
+    var currentTime = 0;
+    var timeouts = {};
+    var countTimeout = 0;
+
+    mailUtils.clearTimeout = function (id) {
+        delete timeouts[id];
+    };
+
+    mailUtils.setTimeout = function (func, duration) {
+        duration = duration || 0;
+        var executeTime = currentTime + duration;
+        countTimeout++;
+        timeouts[countTimeout] = {
+            executeTime: executeTime,
+            func: func
+        };
+        return countTimeout;
+    };
+    /**
+     * @return {integer|boolean} id of the next timeout in queue, false if queue is empty
+     */
+    function getNextTimeoutId() {
+        var minKey = false;
+        _.each(timeouts, function (value, key) {
+            if (minKey === false) {
+                minKey = Number(key);
+                return;
+            }
+            var minTime = timeouts[minKey].executeTime;
+            if (value.executeTime < minTime || (value.executeTime === minTime && key < minKey)) {
+                minKey = Number(key);
+            }
+        });
+        return minKey;
+    }
+
+    /**
+     * @return {integer|boolean} delay (time interval) before the next timeout in queue is executed.
+     *   Useful to know how much time to advance to execute next timer.
+     */
+    function getNextTimeoutDelay() {
+        var next = getNextTimeoutId();
+        if (next === false) {
+            return false;
+        }
+        return timeouts[next].executeTime - currentTime;
+    }
+
+    /**
+     * Set the current time to given time
+     *
+     * @param {integer} time
+     */
+    function setTime(time) {
+        var next = getNextTimeoutId();
+        if (next !== false && timeouts[next].executeTime <= time) {
+            currentTime = timeouts[next].executeTime;
+            var func = timeouts[next].func;
+            // watch out setTimeout inside setTimeout (recursive)
+            delete timeouts[next];
+            func();
+            setTime(time);
+        }
+        else {
+            currentTime = time;
+        }
+    }
+
+    /**
+     * Add the given time to current time
+     *
+     * @param {integer} time
+     */
+    function addTime(time) {
+        setTime(currentTime + time);
+    }
+
+    /**
+     * Set time to the max time in queue and execute all timeouts before this time.
+     */
+    function runPendingTimeouts() {
+        var maxTimeInQueue = 0;
+        _.each(timeouts, function (value, key) {
+            if (value.executeTime > maxTimeInQueue) {
+                maxTimeInQueue = value.executeTime;
+            }
+        });
+        setTime(maxTimeInQueue);
+    }
+
+    return {
+        addTime: addTime,
+        getNextTimeoutDelay:getNextTimeoutDelay,
+        runPendingTimeouts: runPendingTimeouts,
+        setTime: setTime,
+    };
+};
+
+
+/**
+ * Returns the list of mail services required by the mail components: a
+ * mail_service, and its two dependencies bus_service and local_storage.
+ *
+ * @return {AbstractService[]} an array of 3 services: mail_service, bus_service
+ * and local_storage, in that order
+ */
+function getMailServices() {
+    patchMailTimeouts();
+    return new MockMailService().getServices();
+}
+
 return {
-    createBusService: createBusService,
+    MockMailService: MockMailService,
     createDiscuss: createDiscuss,
+    getMailServices: getMailServices,
+    patchMailTimeouts: patchMailTimeouts,
 };
 
 });

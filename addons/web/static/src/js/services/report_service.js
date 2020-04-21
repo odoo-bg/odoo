@@ -9,14 +9,13 @@ var AbstractService = require('web.AbstractService');
 var core = require('web.core');
 
 var ReportService = AbstractService.extend({
-    name: 'report',
     dependencies: ['ajax'],
 
     /**
      * Checks the state of the installation of wkhtmltopdf on the server.
      * Implements an internal cache to do the request only once.
      *
-     * @returns {Deferred} resolved with the state of wkhtmltopdf on the server
+     * @returns {Promise} resolved with the state of wkhtmltopdf on the server
      *   (possible values are 'ok', 'broken', 'install', 'upgrade', 'workers').
      */
     checkWkhtmltopdf: function () {

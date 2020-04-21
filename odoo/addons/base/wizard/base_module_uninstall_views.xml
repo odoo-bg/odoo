@@ -19,7 +19,7 @@
                             <templates>
                                 <t t-name="kanban-box">
                                     <div class="oe_module_vignette">
-                                        <img t-attf-src="#{record.icon.value}"
+                                        <img t-attf-src="#{record.icon.value}" alt="Icon"
                                              class="oe_module_icon" style="width: 60px; height: 60px"/>
                                         <div class="oe_module_desc" style="padding-left: 70px">
                                             <h4><field name="shortdesc"/></h4>
@@ -40,9 +40,18 @@
                             <field name="count"/>
                         </tree>
                     </field>
+                    <div class="alert alert-warning" role="alert">
+                        <p>
+                            Module uninstallation is not always consistent and can sometimes lead to issues,
+                            some data may be deleted, the database could be left in an unstable state,
+                            the server could crash, etc. While this is rare, we recommend testing
+                            the uninstallation procedure on a duplicate database to guarantee that
+                            it works and then doing it on your production database.
+                        </p>
+                    </div>
                     <footer>
-                        <button string="Confirm" class="btn-primary" type="object" name="action_uninstall"/>
-                        <button string="Cancel" class="btn-default" special="cancel"/>
+                        <button string="Cancel" class="btn-primary" special="cancel"/>
+                        <button string="Confirm" class="btn-secondary" type="object" name="action_uninstall"/>
                     </footer>
                 </form>
             </field>

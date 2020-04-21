@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <template id="assets_backend" name="iap assets" inherit_id="web.assets_backend">
+        <xpath expr="." position="inside">
+            <script type="text/javascript" src="/snailmail/static/src/js/mail_failure.js"></script>
+            <script type="text/javascript" src="/snailmail/static/src/js/message.js"></script>
+            <script type="text/javascript" src="/snailmail/static/src/js/systray_messaging_menu.js"></script>
+            <script type="text/javascript" src="/snailmail/static/src/js/thread_widget.js"></script>
+        </xpath>
+    </template>
+
+    <template id="qunit_suite" name="snailmail_tests" inherit_id="web.qunit_suite_tests">
+        <xpath expr="." position="inside">
+            <script type="text/javascript" src="/snailmail/static/tests/chatter_snailmail_tests.js"></script>
+        </xpath>
+    </template>
+</odoo>

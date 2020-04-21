@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import print_function
 import ast
+import copy
 import json
 import logging
 from collections import OrderedDict
@@ -10,10 +11,9 @@ from lxml import html
 from lxml import etree
 from werkzeug import urls
 
-from odoo.tools import pycompat
-
 from odoo import api, models, tools
 from odoo.tools.safe_eval import assert_valid_codeobj, _BUILTINS, _SAFE_OPCODES
+from odoo.tools.misc import get_lang
 from odoo.http import request
 from odoo.modules.module import get_resource_path
 
@@ -33,6 +33,7 @@ class IrQWeb(models.AbstractModel, QWeb):
     """
 
     _name = 'ir.qweb'
+    _description = 'Qweb'
 
     @api.model
     def render(self, id_or_xml_id, values=None, **options):
@@ -54,7 +55,38 @@ class IrQWeb(models.AbstractModel, QWeb):
         context = dict(self.env.context, dev_mode='qweb' in tools.config['dev_mode'])
         context.update(options)
 
-        return super(IrQWeb, self).render(id_or_xml_id, values=values, **context)
+        result = super(IrQWeb, self).render(id_or_xml_id, values=values, **context)
+
+        if b'data-pagebreak=' not in result:
+            return result
+
+        fragments = html.fragments_fromstring(result.decode('utf-8'))
+
+        for fragment in fragments:
+            for row in fragment.iterfind('.//tr[@data-pagebreak]'):
+                table = next(row.iterancestors('table'))
+                newtable = html.Element('table', attrib=dict(table.attrib))
+                thead = table.find('thead')
+                if thead:
+                    newtable.append(copy.deepcopy(thead))
+                # TODO: copy caption & tfoot as well?
+                # TODO: move rows in a tbody if row.getparent() is one?
+
+                pos = row.get('data-pagebreak')
+                assert pos in ('before', 'after')
+                for sibling in row.getparent().iterchildren('tr'):
+                    if sibling is row:
+                        if pos == 'after':
+                            newtable.append(sibling)
+                        break
+                    newtable.append(sibling)
+
+                table.addprevious(newtable)
+                table.addprevious(html.Element('div', attrib={
+                    'style': 'page-break-after: always'
+                }))
+
+        return b''.join(html.tostring(f) for f in fragments)
 
     def default_values(self):
         """ attributes add to the values for each computed template
@@ -74,10 +106,14 @@ class IrQWeb(models.AbstractModel, QWeb):
         tools.ormcache('id_or_xml_id', 'tuple(options.get(k) for k in self._get_template_cache_keys())'),
     )
     def compile(self, id_or_xml_id, options):
+        try:
+            id_or_xml_id = int(id_or_xml_id)
+        except:
+            pass
         return super(IrQWeb, self).compile(id_or_xml_id, options=options)
 
     def load(self, name, options):
-        lang = options.get('lang', 'en_US')
+        lang = options.get('lang', get_lang(self.env).code)
         env = self.env
         if lang != env.context.get('lang'):
             env = env(context=dict(env.context, lang=lang))
@@ -93,12 +129,12 @@ class IrQWeb(models.AbstractModel, QWeb):
             view = self.env['ir.ui.view'].browse(view_id)
             return view.inherit_id is not None
 
-        if isinstance(name, pycompat.integer_types) or is_child_view(name):
-            for node in etree.fromstring(template):
+        if isinstance(name, int) or is_child_view(name):
+            view = etree.fromstring(template)
+            for node in view:
                 if node.get('t-name'):
                     node.set('t-name', str(name))
-                    return node.getparent()
-            return None  # trigger "template not found" in QWeb
+            return view
         else:
             return template
 
@@ -113,7 +149,7 @@ class IrQWeb(models.AbstractModel, QWeb):
     # compile directives
 
     def _compile_directive_lang(self, el, options):
-        lang = el.attrib.pop('t-lang', 'en_US')
+        lang = el.attrib.pop('t-lang', get_lang(self.env).code)
         if el.get('t-call-options'):
             el.set('t-call-options', el.get('t-call-options')[0:-1] + u', "lang": %s}' % lang)
         else:
@@ -125,76 +161,146 @@ class IrQWeb(models.AbstractModel, QWeb):
         if len(el):
             raise SyntaxError("t-call-assets cannot contain children nodes")
 
-        # self._get_asset(xmlid, options, css=css, js=js, debug=values.get('debug'), async=async, values=values)
+        # nodes = self._get_asset_nodes(xmlid, options, css=css, js=js, debug=values.get('debug'), async=async, values=values)
+        #
+        # for index, (tagName, t_attrs, content) in enumerate(nodes):
+        #     if index:
+        #         append('\n        ')
+        #     append('<')
+        #     append(tagName)
+        #
+        #     self._post_processing_att(tagName, t_attrs, options)
+        #     for name, value in t_attrs.items():
+        #         if value or isinstance(value, string_types)):
+        #             append(u' ')
+        #             append(name)
+        #             append(u'="')
+        #             append(escape(pycompat.to_text((value)))
+        #             append(u'"')
+        #
+        #     if not content and tagName in self._void_elements:
+        #         append('/>')
+        #     else:
+        #         append('>')
+        #         if content:
+        #           append(content)
+        #         append('</')
+        #         append(tagName)
+        #         append('>')
+        #
+        space = el.getprevious() is not None and el.getprevious().tail or el.getparent().text
+        sep = u'\n' + space.rsplit('\n').pop()
         return [
-            self._append(ast.Call(
-                func=ast.Attribute(
-                    value=ast.Name(id='self', ctx=ast.Load()),
-                    attr='_get_asset',
-                    ctx=ast.Load()
+            ast.Assign(
+                targets=[ast.Name(id='nodes', ctx=ast.Store())],
+                value=ast.Call(
+                    func=ast.Attribute(
+                        value=ast.Name(id='self', ctx=ast.Load()),
+                        attr='_get_asset_nodes',
+                        ctx=ast.Load()
+                    ),
+                    args=[
+                        ast.Str(el.get('t-call-assets')),
+                        ast.Name(id='options', ctx=ast.Load()),
+                    ],
+                    keywords=[
+                        ast.keyword('css', self._get_attr_bool(el.get('t-css', True))),
+                        ast.keyword('js', self._get_attr_bool(el.get('t-js', True))),
+                        ast.keyword('debug', ast.Call(
+                            func=ast.Attribute(
+                                value=ast.Name(id='values', ctx=ast.Load()),
+                                attr='get',
+                                ctx=ast.Load()
+                            ),
+                            args=[ast.Str('debug')],
+                            keywords=[], starargs=None, kwargs=None
+                        )),
+                        ast.keyword('async_load', self._get_attr_bool(el.get('async_load', False))),
+                        ast.keyword('defer_load', self._get_attr_bool(el.get('defer_load', False))),
+                        ast.keyword('lazy_load', self._get_attr_bool(el.get('lazy_load', False))),
+                        ast.keyword('values', ast.Name(id='values', ctx=ast.Load())),
+                    ],
+                    starargs=None, kwargs=None
+                )
+            ),
+            ast.For(
+                target=ast.Tuple(elts=[
+                    ast.Name(id='index', ctx=ast.Store()),
+                    ast.Tuple(elts=[
+                        ast.Name(id='tagName', ctx=ast.Store()),
+                        ast.Name(id='t_attrs', ctx=ast.Store()),
+                        ast.Name(id='content', ctx=ast.Store())
+                    ], ctx=ast.Store())
+                ], ctx=ast.Store()),
+                iter=ast.Call(
+                    func=ast.Name(id='enumerate', ctx=ast.Load()),
+                    args=[ast.Name(id='nodes', ctx=ast.Load())],
+                    keywords=[],
+                    starargs=None, kwargs=None
                 ),
-                args=[
-                    ast.Str(el.get('t-call-assets')),
-                    ast.Name(id='options', ctx=ast.Load()),
-                ],
-                keywords=[
-                    ast.keyword('css', self._get_attr_bool(el.get('t-css', True))),
-                    ast.keyword('js', self._get_attr_bool(el.get('t-js', True))),
-                    ast.keyword('debug', ast.Call(
-                        func=ast.Attribute(
-                            value=ast.Name(id='values', ctx=ast.Load()),
-                            attr='get',
-                            ctx=ast.Load()
+                body=[
+                    ast.If(
+                        test=ast.Name(id='index', ctx=ast.Load()),
+                        body=[self._append(ast.Str(sep))],
+                        orelse=[]
+                    ),
+                    self._append(ast.Str(u'<')),
+                    self._append(ast.Name(id='tagName', ctx=ast.Load())),
+                ] + self._append_attributes() + [
+                    ast.If(
+                        test=ast.BoolOp(
+                            op=ast.And(),
+                            values=[
+                                ast.UnaryOp(ast.Not(), ast.Name(id='content', ctx=ast.Load()), lineno=0, col_offset=0),
+                                ast.Compare(
+                                    left=ast.Name(id='tagName', ctx=ast.Load()),
+                                    ops=[ast.In()],
+                                    comparators=[ast.Attribute(
+                                        value=ast.Name(id='self', ctx=ast.Load()),
+                                        attr='_void_elements',
+                                        ctx=ast.Load()
+                                    )]
+                                ),
+                            ]
                         ),
-                        args=[ast.Str('debug')],
-                        keywords=[], starargs=None, kwargs=None
-                    )),
-                    ast.keyword('async', self._get_attr_bool(el.get('async', False))),
-                    ast.keyword('values', ast.Name(id='values', ctx=ast.Load())),
+                        body=[self._append(ast.Str(u'/>'))],
+                        orelse=[
+                            self._append(ast.Str(u'>')),
+                            ast.If(
+                                test=ast.Name(id='content', ctx=ast.Load()),
+                                body=[self._append(ast.Name(id='content', ctx=ast.Load()))],
+                                orelse=[]
+                            ),
+                            self._append(ast.Str(u'</')),
+                            self._append(ast.Name(id='tagName', ctx=ast.Load())),
+                            self._append(ast.Str(u'>')),
+                        ]
+                    )
                 ],
-                starargs=None, kwargs=None
-            ))
+                orelse=[]
+            )
         ]
 
-    # for backward compatibility to remove after v10
-    def _compile_widget_options(self, el, directive_type):
-        field_options = super(IrQWeb, self)._compile_widget_options(el, directive_type)
-
-        if ('t-%s-options' % directive_type) in el.attrib:
-            if tools.config['dev_mode']:
-                _logger.warning("Use new syntax t-options instead of t-%s-options" % directive_type)
-            if not field_options:
-                field_options = el.attrib.pop('t-%s-options' % directive_type)
-
-        if field_options and 'monetary' in field_options:
-            try:
-                options = "{'widget': 'monetary'"
-                for k, v in json.loads(field_options).items():
-                    if k in ('display_currency', 'from_currency'):
-                        options = "%s, '%s': %s" % (options, k, v)
-                    else:
-                        options = "%s, '%s': '%s'" % (options, k, v)
-                options = "%s}" % options
-                field_options = options
-                _logger.warning("Use new syntax for '%s' monetary widget t-options (python dict instead of deprecated JSON syntax)." % etree.tostring(el))
-            except ValueError:
-                pass
-
-        return field_options
-    # end backward
-
     # method called by computing code
+
+    def get_asset_bundle(self, xmlid, files, env=None):
+        return AssetsBundle(xmlid, files, env=env)
 
     @tools.conditional(
         # in non-xml-debug mode we want assets to be cached forever, and the admin can force a cache clear
         # by restarting the server after updating the source code (or using the "Clear server cache" in debug tools)
         'xml' not in tools.config['dev_mode'],
-        tools.ormcache_context('xmlid', 'options.get("lang", "en_US")', 'css', 'js', 'debug', 'async', keys=("website_id",)),
+        tools.ormcache_context('xmlid', 'options.get("lang", "en_US")', 'css', 'js', 'debug', 'async_load', 'defer_load', 'lazy_load', keys=("website_id",)),
     )
-    def _get_asset(self, xmlid, options, css=True, js=True, debug=False, async=False, values=None):
+    def _get_asset_nodes(self, xmlid, options, css=True, js=True, debug=False, async_load=False, defer_load=False, lazy_load=False, values=None):
         files, remains = self._get_asset_content(xmlid, options)
-        asset = AssetsBundle(xmlid, files, remains, env=self.env)
-        return asset.to_html(css=css, js=js, debug=debug, async=async, url_for=(values or {}).get('url_for', lambda url: url))
+        asset = self.get_asset_bundle(xmlid, files, env=self.env)
+        remains = [node for node in remains if (css and node[0] == 'link') or (js and node[0] != 'link')]
+        return remains + asset.to_node(css=css, js=js, debug=debug, async_load=async_load, defer_load=defer_load, lazy_load=lazy_load)
+
+    def _get_asset_link_urls(self, xmlid, options):
+        asset_nodes = self._get_asset_nodes(xmlid, options, js=False)
+        return [node[1]['href'] for node in asset_nodes if node[0] == 'link']
 
     @tools.ormcache_context('xmlid', 'options.get("lang", "en_US")', keys=("website_id",))
     def _get_asset_content(self, xmlid, options):
@@ -203,7 +309,11 @@ class IrQWeb(models.AbstractModel, QWeb):
             edit_translations=False, translatable=False,
             rendering_bundle=True)
 
-        env = self.env(context=options)
+        options['website_id'] = self.env.context.get('website_id')
+        IrQweb = self.env['ir.qweb'].with_context(options)
+
+        def can_aggregate(url):
+            return not urls.url_parse(url).scheme and not urls.url_parse(url).netloc and not url.startswith('/web/content')
 
         # TODO: This helper can be used by any template that wants to embedd the backend.
         #       It is currently necessary because the ir.ui.view bundle inheritance does not
@@ -213,49 +323,49 @@ class IrQWeb(models.AbstractModel, QWeb):
                 from odoo.addons.web.controllers.main import module_boot
                 return json.dumps(module_boot())
             return '[]'
-        template = env['ir.qweb'].render(xmlid, {"get_modules_order": get_modules_order})
+        template = IrQweb.render(xmlid, {"get_modules_order": get_modules_order})
 
         files = []
         remains = []
         for el in html.fragments_fromstring(template):
-            if isinstance(el, pycompat.string_types):
-                remains.append(pycompat.to_text(el))
-            elif isinstance(el, html.HtmlElement):
+            if isinstance(el, html.HtmlElement):
                 href = el.get('href', '')
                 src = el.get('src', '')
                 atype = el.get('type')
                 media = el.get('media')
 
-                can_aggregate = not urls.url_parse(href).netloc and not href.startswith('/web/content')
-                if el.tag == 'style' or (el.tag == 'link' and el.get('rel') == 'stylesheet' and can_aggregate):
+                if can_aggregate(href) and (el.tag == 'style' or (el.tag == 'link' and el.get('rel') == 'stylesheet')):
                     if href.endswith('.sass'):
                         atype = 'text/sass'
+                    elif href.endswith('.scss'):
+                        atype = 'text/scss'
                     elif href.endswith('.less'):
                         atype = 'text/less'
-                    if atype not in ('text/less', 'text/sass'):
+                    if atype not in ('text/less', 'text/scss', 'text/sass'):
                         atype = 'text/css'
                     path = [segment for segment in href.split('/') if segment]
                     filename = get_resource_path(*path) if path else None
                     files.append({'atype': atype, 'url': href, 'filename': filename, 'content': el.text, 'media': media})
-                elif el.tag == 'script':
+                elif can_aggregate(src) and el.tag == 'script':
                     atype = 'text/javascript'
                     path = [segment for segment in src.split('/') if segment]
                     filename = get_resource_path(*path) if path else None
                     files.append({'atype': atype, 'url': src, 'filename': filename, 'content': el.text, 'media': media})
                 else:
-                    remains.append(html.tostring(el, encoding='unicode'))
+                    remains.append((el.tag, OrderedDict(el.attrib), el.text))
             else:
-                try:
-                    remains.append(html.tostring(el, encoding='unicode'))
-                except Exception:
-                    # notYETimplementederror
-                    raise NotImplementedError
+                # the other cases are ignored
+                pass
 
         return (files, remains)
 
     def _get_field(self, record, field_name, expression, tagName, field_options, options, values):
         field = record._fields[field_name]
 
+        # adds template compile options for rendering fields
+        field_options['template_options'] = options
+
+        # adds generic field options
         field_options['tagName'] = tagName
         field_options['expression'] = expression
         field_options['type'] = field_options.get('widget', field.type)
@@ -275,6 +385,9 @@ class IrQWeb(models.AbstractModel, QWeb):
         return (attributes, content, inherit_branding or translate)
 
     def _get_widget(self, value, expression, tagName, field_options, options, values):
+        # adds template compile options for rendering fields
+        field_options['template_options'] = options
+
         field_options['type'] = field_options['widget']
         field_options['tagName'] = tagName
         field_options['expression'] = expression

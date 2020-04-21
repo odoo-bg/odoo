@@ -8,7 +8,7 @@ import psycopg2
 import pytz
 
 from odoo import api, fields, models, _
-from odoo.tools import ustr, pycompat
+from odoo.tools import ustr
 
 REFERENCING_FIELDS = {None, 'id', '.id'}
 def only_ref_fields(record):
@@ -34,13 +34,14 @@ class ConversionNotFound(ValueError):
 
 class IrFieldsConverter(models.AbstractModel):
     _name = 'ir.fields.converter'
+    _description = 'Fields Converter'
 
     @api.model
     def _format_import_error(self, error_type, error_msg, error_params=(), error_args=None):
         # sanitize error params for later formatting by the import system
-        sanitize = lambda p: p.replace('%', '%%') if isinstance(p, pycompat.string_types) else p
+        sanitize = lambda p: p.replace('%', '%%') if isinstance(p, str) else p
         if error_params:
-            if isinstance(error_params, pycompat.string_types):
+            if isinstance(error_params, str):
                 error_params = sanitize(error_params)
             elif isinstance(error_params, dict):
                 error_params = {k: sanitize(v) for k, v in error_params.items()}
@@ -78,7 +79,7 @@ class IrFieldsConverter(models.AbstractModel):
                 try:
                     converted[field], ws = converters[field](value)
                     for w in ws:
-                        if isinstance(w, pycompat.string_types):
+                        if isinstance(w, str):
                             # wrap warning string in an ImportWarning for
                             # uniform handling
                             w = ImportWarning(w)
@@ -269,14 +270,14 @@ class IrFieldsConverter(models.AbstractModel):
         for item, label in selection:
             label = ustr(label)
             labels = [label] + self._get_translations(('selection', 'model', 'code'), label)
-            if value == pycompat.text_type(item) or value in labels:
+            if value == str(item) or value in labels:
                 return item, []
 
         raise self._format_import_error(
             ValueError,
             _(u"Value '%s' not found in selection field '%%(field)s'"),
             value,
-            {'moreinfo': [_label or pycompat.text_type(item) for item, _label in selection if _label or item]}
+            {'moreinfo': [_label or str(item) for item, _label in selection if _label or item]}
         )
 
     @api.model
@@ -297,12 +298,20 @@ class IrFieldsConverter(models.AbstractModel):
                  warnings
         :rtype: (ID|None, unicode, list)
         """
+        # the function 'flush' comes from BaseModel.load(), and forces the
+        # creation/update of former records (batch creation)
+        flush = self._context.get('import_flush', lambda arg=None: None)
+
         id = None
         warnings = []
-        action = {'type': 'ir.actions.act_window', 'target': 'new',
-                  'view_mode': 'tree,form', 'view_type': 'form',
-                  'views': [(False, 'tree'), (False, 'form')],
-                  'help': _(u"See all possible values")}
+        error_msg = ''
+        action = {
+            'name': 'Possible Values',
+            'type': 'ir.actions.act_window', 'target': 'new',
+            'view_mode': 'tree,form',
+            'views': [(False, 'list'), (False, 'form')],
+            'context': {'create': False},
+            'help': _(u"See all possible values")}
         if subfield is None:
             action['res_model'] = field.comodel_name
         elif subfield in ('id', '.id'):
@@ -312,6 +321,8 @@ class IrFieldsConverter(models.AbstractModel):
         RelatedModel = self.env[field.comodel_name]
         if subfield == '.id':
             field_type = _(u"database id")
+            if isinstance(value, str) and not self._str_to_boolean(model, field, value)[0]:
+                return False, field_type, warnings
             try: tentative_id = int(value)
             except ValueError: tentative_id = value
             try:
@@ -326,16 +337,19 @@ class IrFieldsConverter(models.AbstractModel):
                     {'moreinfo': action})
         elif subfield == 'id':
             field_type = _(u"external id")
+            if not self._str_to_boolean(model, field, value)[0]:
+                return False, field_type, warnings
             if '.' in value:
                 xmlid = value
             else:
                 xmlid = "%s.%s" % (self._context.get('_import_current_module', ''), value)
-            try:
-                id = self.env.ref(xmlid).id
-            except ValueError:
-                pass # leave id is None
+            flush(xmlid)
+            id = self.env['ir.model.data'].xmlid_to_res_id(xmlid, raise_if_not_found=False) or None
         elif subfield is None:
             field_type = _(u"name")
+            if value == '':
+                return False, field_type, warnings
+            flush()
             ids = RelatedModel.name_search(name=value, operator='=')
             if ids:
                 if len(ids) > 1:
@@ -343,6 +357,13 @@ class IrFieldsConverter(models.AbstractModel):
                         _(u"Found multiple matches for field '%%(field)s' (%d matches)")
                         % (len(ids))))
                 id, _name = ids[0]
+            else:
+                name_create_enabled_fields = self.env.context.get('name_create_enabled_fields') or {}
+                if name_create_enabled_fields.get(field.name):
+                    try:
+                        id, _name = RelatedModel.name_create(name=value)
+                    except (Exception, psycopg2.IntegrityError):
+                        error_msg = _(u"Cannot create new '%s' records from their name alone. Please create those records manually and try importing again.") % RelatedModel._description
         else:
             raise self._format_import_error(
                 Exception,
@@ -351,10 +372,14 @@ class IrFieldsConverter(models.AbstractModel):
             )
 
         if id is None:
+            if error_msg:
+                message = _("No matching record found for %(field_type)s '%(value)s' in field '%%(field)s' and the following error was encountered when we attempted to create one: %(error_message)s")
+            else:
+                message = _("No matching record found for %(field_type)s '%(value)s' in field '%%(field)s'")
             raise self._format_import_error(
                 ValueError,
-                _(u"No matching record found for %(field_type)s '%(value)s' in field '%%(field)s'"),
-                {'field_type': field_type, 'value': value},
+                message,
+                {'field_type': field_type, 'value': value, 'error_message': error_msg},
                 {'moreinfo': action})
         return id, field_type, warnings
 
@@ -392,6 +417,10 @@ class IrFieldsConverter(models.AbstractModel):
         return id, w1 + w2
 
     @api.model
+    def _str_to_many2one_reference(self, model, field, value):
+        return self._str_to_integer(model, field, value)
+
+    @api.model
     def _str_to_many2many(self, model, field, value):
         [record] = value
 
@@ -423,24 +452,31 @@ class IrFieldsConverter(models.AbstractModel):
             # [{subfield:ref1},{subfield:ref2},{subfield:ref3}]
             records = ({subfield:item} for item in record[subfield].split(','))
 
-        def log(_, e):
-            if not isinstance(e, Warning):
-                raise e
-            warnings.append(e)
+        def log(f, exception):
+            if not isinstance(exception, Warning):
+                current_field_name = self.env[field.comodel_name]._fields[f].string
+                arg0 = exception.args[0] % {'field': '%(field)s/' + current_field_name}
+                exception.args = (arg0, *exception.args[1:])
+                raise exception
+            warnings.append(exception)
 
         convert = self.for_model(self.env[field.comodel_name])
 
         for record in records:
             id = None
             refs = only_ref_fields(record)
-            # there are ref fields in the record
+            writable = convert(exclude_ref_fields(record), log)
             if refs:
                 subfield, w1 = self._referencing_subfield(refs)
                 warnings.extend(w1)
-                id, _, w2 = self.db_id_for(model, field, subfield, record[subfield])
-                warnings.extend(w2)
+                try:
+                    id, _, w2 = self.db_id_for(model, field, subfield, record[subfield])
+                    warnings.extend(w2)
+                except ValueError:
+                    if subfield != 'id':
+                        raise
+                    writable['id'] = record['id']
 
-            writable = convert(exclude_ref_fields(record), log)
             if id:
                 commands.append(LINK_TO(id))
                 commands.append(UPDATE(id, writable))
@@ -448,3 +484,37 @@ class IrFieldsConverter(models.AbstractModel):
                 commands.append(CREATE(writable))
 
         return commands, warnings
+
+class O2MIdMapper(models.AbstractModel):
+    """
+    Updates the base class to support setting xids directly in create by
+    providing an "id" key (otherwise stripped by create) during an import
+    (which should strip 'id' from the input data anyway)
+    """
+    _inherit = 'base'
+
+    # sadly _load_records_create is only called for the toplevel record so we
+    # can't hook into that
+    @api.model_create_multi
+    @api.returns('self', lambda value: value.id)
+    def create(self, vals_list):
+        recs = super().create(vals_list)
+
+        import_module = self.env.context.get('_import_current_module')
+        if not import_module: # not an import -> bail
+            return recs
+        noupdate = self.env.context.get('noupdate', False)
+
+        xids = (v.get('id') for v in vals_list)
+        self.env['ir.model.data']._update_xmlids([
+            {
+                'xml_id': xid if '.' in xid else ('%s.%s' % (import_module, xid)),
+                'record': rec,
+                # note: this is not used when updating o2ms above...
+                'noupdate': noupdate,
+            }
+            for rec, xid in zip(recs, xids)
+            if xid and isinstance(xid, str)
+        ])
+
+        return recs

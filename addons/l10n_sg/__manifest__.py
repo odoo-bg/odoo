@@ -7,8 +7,7 @@
     'name': 'Singapore - Accounting',
     'author': 'Tech Receptives',
     'version': '2.0',
-    'website': 'http://www.techreceptives.com',
-    'category': 'Localization',
+    'category': 'Accounting/Localizations',
     'description': """
 Singapore accounting chart and localization.
 =======================================================
@@ -23,6 +22,7 @@ This module add, for accounting:
     'data': [
         'data/l10n_sg_chart_data.xml',
         'data/account_data.xml',
+        'data/account_tax_report_data.xml',
         'data/account_tax_data.xml',
         'data/account_chart_template_data.xml',
         'views/account_invoice_view.xml',

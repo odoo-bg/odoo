@@ -14,17 +14,33 @@ FormController.include({
     }),
 
     //--------------------------------------------------------------------------
+    // Public
+    //--------------------------------------------------------------------------
+
+    /**
+     * @override
+     */
+    async saveRecord() {
+        const changedFields = await this._super(...arguments);
+        const chatter = this.renderer.chatter;
+        if (chatter) {
+            await chatter.updateSuggestedPartners();
+        }
+        return changedFields;
+    },
+
+    //--------------------------------------------------------------------------
     // Handlers
     //--------------------------------------------------------------------------
 
     /**
      * @private
-     * @param {OdooEvent} event
+     * @param {OdooEvent} ev
      * @param {string} event.data.id datapointID
-     * @param {integer[]} event.data.msgIDs list of message ids
+     * @param {integer[]} event.data.messageIDs list of message IDs
      */
-    _onNewMessage: function (event) {
-        this.model.updateMessageIDs(event.data.id, event.data.msgIDs);
+    _onNewMessage: function (ev) {
+        this.model.updateMessageIDs(ev.data.id, ev.data.messageIDs);
     },
 });
 

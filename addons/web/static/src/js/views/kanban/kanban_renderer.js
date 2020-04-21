@@ -2,15 +2,18 @@ odoo.define('web.KanbanRenderer', function (require) {
 "use strict";
 
 var BasicRenderer = require('web.BasicRenderer');
+var ColumnQuickCreate = require('web.kanban_column_quick_create');
+var config = require('web.config');
 var core = require('web.core');
 var KanbanColumn = require('web.KanbanColumn');
 var KanbanRecord = require('web.KanbanRecord');
-var ColumnQuickCreate = require('web.kanban_column_quick_create');
 var QWeb = require('web.QWeb');
 var session = require('web.session');
 var utils = require('web.utils');
+var viewUtils = require('web.viewUtils');
 
 var qweb = core.qweb;
+var _t = core._t;
 
 function findInNode(node, predicate) {
     if (predicate(node)) {
@@ -81,22 +84,32 @@ function transformQwebTemplate(node, fields) {
 
 var KanbanRenderer = BasicRenderer.extend({
     className: 'o_kanban_view',
+    config: { // the KanbanRecord and KanbanColumn classes to use (may be overridden)
+        KanbanColumn: KanbanColumn,
+        KanbanRecord: KanbanRecord,
+    },
     custom_events: _.extend({}, BasicRenderer.prototype.custom_events || {}, {
         close_quick_create: '_onCloseQuickCreate',
-        cancel_quick_create: '_onCloseQuickCreate',
+        cancel_quick_create: '_onCancelQuickCreate',
         set_progress_bar_state: '_onSetProgressBarState',
         start_quick_create: '_onStartQuickCreate',
         quick_create_column_updated: '_onQuickCreateColumnUpdated',
     }),
+    events:_.extend({}, BasicRenderer.prototype.events || {}, {
+        'keydown .o_kanban_record' : '_onRecordKeyDown'
+    }),
 
     /**
      * @override
+     * @param {Object} params
+     * @param {boolean} params.quickCreateEnabled set to false to disable the
+     *   quick create feature
      */
     init: function (parent, state, params) {
         this._super.apply(this, arguments);
 
         this.widgets = [];
-        this.qweb = new QWeb(session.debug, {_s: session.origin}, false);
+        this.qweb = new QWeb(config.isDebug(), {_s: session.origin}, false);
         var templates = findInNode(this.arch, function (n) { return n.tag === 'templates';});
         transformQwebTemplate(templates, state.fields);
         this.qweb.add_template(utils.json_node_to_xml(templates));
@@ -105,9 +118,14 @@ var KanbanRenderer = BasicRenderer.extend({
             qweb: this.qweb,
             viewType: 'kanban',
         });
-        this.columnOptions = _.extend({}, params.column_options);
+        this.columnOptions = _.extend({KanbanRecord: this.config.KanbanRecord}, params.column_options);
         if (this.columnOptions.hasProgressBar) {
             this.columnOptions.progressBarStates = {};
+        }
+        this.quickCreateEnabled = params.quickCreateEnabled;
+        if (!params.readOnlyMode) {
+            var handleField = _.findWhere(this.state.fieldsInfo.kanban, {widget: 'handle'});
+            this.handleField = handleField && handleField.name;
         }
         this._setState(state);
     },
@@ -115,9 +133,18 @@ var KanbanRenderer = BasicRenderer.extend({
      * Called each time the renderer is attached into the DOM.
      */
     on_attach_callback: function () {
+        this._isInDom = true;
+        _.invoke(this.widgets, 'on_attach_callback');
         if (this.quickCreate) {
             this.quickCreate.on_attach_callback();
         }
+    },
+    /**
+     * Called each time the renderer is detached from the DOM.
+     */
+    on_detach_callback: function () {
+        this._isInDom = false;
+        _.invoke(this.widgets, 'on_detach_callback');
     },
 
     //--------------------------------------------------------------------------
@@ -127,10 +154,16 @@ var KanbanRenderer = BasicRenderer.extend({
     /**
      * Displays the quick create record in the first column.
      *
-     * @returns {Deferred}
+     * @returns {Promise}
      */
     addQuickCreate: function () {
         return this.widgets[0].addQuickCreate();
+    },
+    /**
+     * Focuses the first kanban record
+     */
+    giveFocus: function () {
+        this.$('.o_kanban_record:first').focus();
     },
     /**
      * Toggle fold/unfold the Column quick create widget
@@ -138,15 +171,6 @@ var KanbanRenderer = BasicRenderer.extend({
     quickCreateToggleFold: function () {
         this.quickCreate.toggleFold();
         this._toggleNoContentHelper();
-    },
-    /**
-     * Removes a widget (record if ungrouped, column if grouped) from the view.
-     *
-     * @param {Widget} widget the instance of the widget to remove
-     */
-    removeWidget: function (widget) {
-        this.widgets.splice(this.widgets.indexOf(widget), 1);
-        widget.destroy();
     },
     /**
      * Updates a given column with its new state.
@@ -158,10 +182,11 @@ var KanbanRenderer = BasicRenderer.extend({
      * @param {boolean} [options.openQuickCreate] if true, directly opens the
      *   QuickCreate widget in the updated column
      *
-     * @returns {Deferred}
+     * @returns {Promise}
      */
     updateColumn: function (localID, columnState, options) {
         var self = this;
+        var KanbanColumn = this.config.KanbanColumn;
         var newColumn = new KanbanColumn(this, columnState, this.columnOptions, this.recordOptions);
         var index = _.findIndex(this.widgets, {db_id: localID});
         var column = this.widgets[index];
@@ -174,7 +199,7 @@ var KanbanRenderer = BasicRenderer.extend({
             if (options && options.openQuickCreate) {
                 def = newColumn.addQuickCreate();
             }
-            return $.when(def).then(function () {
+            return Promise.resolve(def).then(function () {
                 newColumn.$el.insertAfter(column.$el);
                 self._toggleNoContentHelper();
                 // When a record has been quick created, the new column directly
@@ -191,6 +216,7 @@ var KanbanRenderer = BasicRenderer.extend({
      * Updates a given record with its new state.
      *
      * @param {Object} recordState
+     * @returns {Promise}
      */
     updateRecord: function (recordState) {
         var isGrouped = !!this.state.groupedBy.length;
@@ -209,15 +235,15 @@ var KanbanRenderer = BasicRenderer.extend({
         }
 
         if (record) {
-            record.update(recordState);
+            return record.update(recordState);
         }
+        return Promise.resolve();
     },
     /**
      * @override
      */
     updateState: function (state) {
         this._setState(state);
-        this._toggleNoContentHelper();
         return this._super.apply(this, arguments);
     },
 
@@ -226,17 +252,73 @@ var KanbanRenderer = BasicRenderer.extend({
     //--------------------------------------------------------------------------
 
     /**
+     * @private
+     * @param {DOMElement} currentColumn
+     */
+    _focusOnNextCard: function (currentCardElement) {
+        var nextCard = currentCardElement.nextElementSibling;
+        if (nextCard) {
+            nextCard.focus();
+        }
+    },
+    /**
+     * Tries to give focus to the previous card, and returns true if successful
+     * 
+     * @private
+     * @param {DOMElement} currentColumn
+     * @returns {boolean}
+     */
+    _focusOnPreviousCard: function (currentCardElement) {
+        var previousCard = currentCardElement.previousElementSibling;
+        if (previousCard && previousCard.classList.contains("o_kanban_record")) { //previous element might be column title
+            previousCard.focus();
+            return true;
+        }
+    },
+    /**
+     * Returns the default columns for the kanban view example background.
+     * You can override this method to easily customize the column names.
+     *
+     * @private
+     */
+    _getGhostColumns: function () {
+        if (this.examples && this.examples.ghostColumns) {
+            return this.examples.ghostColumns;
+        }
+        return _.map(_.range(1, 5), function (num) {
+            return _.str.sprintf(_t("Column %s"), num);
+        });
+    },
+    /**
+     * Render the Example Ghost Kanban card on the background
+     *
+     * @private
+     * @param {DocumentFragment} fragment
+     */
+    _renderExampleBackground: function (fragment) {
+        var $background = $(qweb.render('KanbanView.ExamplesBackground', {ghostColumns: this._getGhostColumns()}));
+        $background.appendTo(fragment);
+    },
+    /**
      * Renders empty invisible divs in a document fragment.
      *
      * @private
      * @param {DocumentFragment} fragment
      * @param {integer} nbDivs the number of divs to append
+     * @param {Object} [options]
+     * @param {string} [options.inlineStyle]
      */
-    _renderGhostDivs: function (fragment, nbDivs) {
+    _renderGhostDivs: function (fragment, nbDivs, options) {
+        var ghostDefs = [];
         for (var $ghost, i = 0; i < nbDivs; i++) {
             $ghost = $('<div>').addClass('o_kanban_record o_kanban_ghost');
-            $ghost.appendTo(fragment);
+            if (options && options.inlineStyle) {
+                $ghost.attr('style', options.inlineStyle);
+            }
+            var def = $ghost.appendTo(fragment);
+            ghostDefs.push(def);
         }
+        return Promise.all(ghostDefs);
     },
     /**
      * Renders an grouped kanban view in a fragment.
@@ -248,15 +330,18 @@ var KanbanRenderer = BasicRenderer.extend({
         var self = this;
 
         // Render columns
+        var KanbanColumn = this.config.KanbanColumn;
         _.each(this.state.data, function (group) {
             var column = new KanbanColumn(self, group, self.columnOptions, self.recordOptions);
+            var def;
             if (!group.value) {
-                column.prependTo(fragment); // display the 'Undefined' group first
+                def = column.prependTo(fragment); // display the 'Undefined' group first
                 self.widgets.unshift(column);
             } else {
-                column.appendTo(fragment);
+                def = column.appendTo(fragment);
                 self.widgets.push(column);
             }
+            self.defs.push(def);
         });
 
         // remove previous sorting
@@ -286,30 +371,19 @@ var KanbanRenderer = BasicRenderer.extend({
                 },
             });
 
-            // Enable column quickcreate
             if (this.createColumnEnabled) {
                 this.quickCreate = new ColumnQuickCreate(this, {
-                    examples: this.examples,
+                    examples: this.examples && this.examples.examples,
                 });
-                this.quickCreate.appendTo(fragment).then(function () {
+                this.defs.push(this.quickCreate.appendTo(fragment).then(function () {
                     // Open it directly if there is no column yet
                     if (!self.state.data.length) {
                         self.quickCreate.toggleFold();
+                        self._renderExampleBackground(fragment);
                     }
-                });
-
+                }));
             }
         }
-    },
-    /**
-     * @private
-     * @override
-     * adds a specific class to the kanban helper so that it can be targetted by specific css
-     */
-    _renderNoContentHelper: function() {
-        var $el = this._super.apply(this, arguments);
-        $el.toggleClass('o_kanban_view_nocontent',true)
-        return $el;
     },
     /**
      * Renders an ungrouped kanban view in a fragment.
@@ -319,37 +393,77 @@ var KanbanRenderer = BasicRenderer.extend({
      */
     _renderUngrouped: function (fragment) {
         var self = this;
+        var KanbanRecord = this.config.KanbanRecord;
+        var kanbanRecord;
         _.each(this.state.data, function (record) {
-            var kanbanRecord = new KanbanRecord(self, record, self.recordOptions);
+            kanbanRecord = new KanbanRecord(self, record, self.recordOptions);
             self.widgets.push(kanbanRecord);
-            kanbanRecord.appendTo(fragment);
+            var def = kanbanRecord.appendTo(fragment);
+            self.defs.push(def);
         });
 
+        // enable record resequencing if there is a field with widget='handle'
+        // and if there is no orderBy (in this case we assume that the widget
+        // has been put on the first default order field of the model), or if
+        // the first orderBy field is the one with widget='handle'
+        var orderedBy = this.state.orderedBy;
+        var hasHandle = this.handleField &&
+                        (orderedBy.length === 0 || orderedBy[0].name === this.handleField);
+        if (hasHandle) {
+            this.$el.sortable({
+                items: '.o_kanban_record:not(.o_kanban_ghost)',
+                cursor: 'move',
+                revert: 0,
+                delay: 0,
+                tolerance: 'pointer',
+                forcePlaceholderSize: true,
+                stop: function (event, ui) {
+                    self._moveRecord(ui.item.data('record').db_id, ui.item.index());
+                },
+            });
+        }
+
         // append ghost divs to ensure that all kanban records are left aligned
-        this._renderGhostDivs(fragment, 6);
+        var prom = Promise.all(self.defs).then(function () {
+            var options = {};
+            if (kanbanRecord) {
+                options.inlineStyle = kanbanRecord.$el.attr('style');
+            }
+            return self._renderGhostDivs(fragment, 6, options);
+        });
+        this.defs.push(prom);
     },
     /**
      * @override
      * @private
      */
     _renderView: function () {
-        var oldWidgets = this.widgets;
-        this.widgets = [];
-        this.$el.empty();
+        var self = this;
 
-        var isGrouped = !!this.state.groupedBy.length;
-        this.$el.toggleClass('o_kanban_grouped', isGrouped);
-        this.$el.toggleClass('o_kanban_ungrouped', !isGrouped);
-        var fragment = document.createDocumentFragment();
         // render the kanban view
+        var isGrouped = !!this.state.groupedBy.length;
+        var fragment = document.createDocumentFragment();
+        var defs = [];
+        this.defs = defs;
         if (isGrouped) {
             this._renderGrouped(fragment);
         } else {
             this._renderUngrouped(fragment);
         }
-        this.$el.append(fragment);
-        this._toggleNoContentHelper();
-        return this._super.apply(this, arguments).then(_.invoke.bind(_, oldWidgets, 'destroy'));
+        delete this.defs;
+
+        return this._super.apply(this, arguments).then(function () {
+            return Promise.all(defs).then(function () {
+                self.$el.empty();
+                self.$el.toggleClass('o_kanban_grouped', isGrouped);
+                self.$el.toggleClass('o_kanban_ungrouped', !isGrouped);
+                self.$el.append(fragment);
+                self._toggleNoContentHelper();
+                if (self._isInDom) {
+                    _.invoke(self.widgets, 'on_attach_callback');
+                }
+            });
+        });
     },
     /**
      * @param {boolean} [remove] if true, the nocontent helper is always removed
@@ -360,7 +474,8 @@ var KanbanRenderer = BasicRenderer.extend({
             !remove &&
             !this._hasContent() &&
             !!this.noContentHelp &&
-            !(this.quickCreate && !this.quickCreate.folded);
+            !(this.quickCreate && !this.quickCreate.folded) &&
+            !this.state.isGroupedByM2ONoColumn;
 
         var $noContentHelper = this.$('.o_view_nocontent');
 
@@ -381,15 +496,18 @@ var KanbanRenderer = BasicRenderer.extend({
         this.state = state;
 
         var groupByField = state.groupedBy[0];
-        var groupByFieldAttrs = state.fields[groupByField];
-        var groupByFieldInfo = state.fieldsInfo.kanban[groupByField];
+        var cleanGroupByField = this._cleanGroupByField(groupByField);
+        var groupByFieldAttrs = state.fields[cleanGroupByField];
+        var groupByFieldInfo = state.fieldsInfo.kanban[cleanGroupByField];
         // Deactivate the drag'n'drop if the groupedBy field:
         // - is a date or datetime since we group by month or
         // - is readonly (on the field attrs or in the view)
         var draggable = true;
+        var grouped_by_date = false;
         if (groupByFieldAttrs) {
             if (groupByFieldAttrs.type === "date" || groupByFieldAttrs.type === "datetime") {
                 draggable = false;
+                grouped_by_date = true;
             } else if (groupByFieldAttrs.readonly !== undefined) {
                 draggable = !(groupByFieldAttrs.readonly);
             }
@@ -407,15 +525,73 @@ var KanbanRenderer = BasicRenderer.extend({
             group_by_tooltip: groupByTooltip,
             groupedBy: groupByField,
             grouped_by_m2o: this.groupedByM2O,
+            grouped_by_date: grouped_by_date,
             relation: relation,
+            quick_create: this.quickCreateEnabled && viewUtils.isQuickCreateEnabled(state),
         });
         this.createColumnEnabled = this.groupedByM2O && this.columnOptions.group_creatable;
+    },
+    /**
+     * Remove date/datetime magic grouping info to get proper field attrs/info from state
+     * ex: sent_date:month will become sent_date
+     *
+     * @private
+     * @param {string} groupByField
+     * @returns {string}
+     */
+    _cleanGroupByField: function (groupByField) {
+        var cleanGroupByField = groupByField;
+        if (cleanGroupByField && cleanGroupByField.indexOf(':') > -1) {
+            cleanGroupByField = cleanGroupByField.substring(0, cleanGroupByField.indexOf(':'));
+        }
+
+        return cleanGroupByField;
+    },
+    /**
+     * Moves the focus on the first card of the next column in a given direction
+     * This ignores the folded columns and skips over the empty columns.
+     * In ungrouped kanban, moves the focus to the next/previous card
+     *
+     * @param {DOMElement} eventTarget  the target of the keydown event
+     * @param {string} direction  contains either 'LEFT' or 'RIGHT'
+     */
+    _focusOnCardInColumn: function(eventTarget, direction) {
+        var currentColumn = eventTarget.parentElement;
+        var hasSelectedACard = false;
+        var cannotSelectAColumn = false;
+        while (!hasSelectedACard && !cannotSelectAColumn) {
+            var candidateColumn = direction === 'LEFT' ?
+                                    currentColumn.previousElementSibling :
+                                    currentColumn.nextElementSibling ;
+            currentColumn = candidateColumn;
+            if (candidateColumn) {
+                var allCardsOfCandidateColumn =
+                    candidateColumn.getElementsByClassName('o_kanban_record');
+                if (allCardsOfCandidateColumn.length) {
+                    allCardsOfCandidateColumn[0].focus();
+                    hasSelectedACard = true;
+                }
+            }
+            else { // either there are no more columns in the direction or
+                   // this is not a grouped kanban
+                direction === 'LEFT' ?
+                    this._focusOnPreviousCard(eventTarget) :
+                    this._focusOnNextCard(eventTarget);
+                cannotSelectAColumn = true;
+            }
+        }
     },
 
     //--------------------------------------------------------------------------
     // Handlers
     //--------------------------------------------------------------------------
 
+    /**
+     * @private
+     */
+    _onCancelQuickCreate: function () {
+        this._toggleNoContentHelper();
+    },
     /**
      * Closes the opened quick create widgets in columns
      *
@@ -429,11 +605,43 @@ var KanbanRenderer = BasicRenderer.extend({
     },
     /**
      * @private
-     * @param {OdooEvent} event
+     * @param {OdooEvent} ev
      */
-    _onQuickCreateColumnUpdated: function (event) {
-        event.stopPropagation();
+    _onQuickCreateColumnUpdated: function (ev) {
+        ev.stopPropagation();
         this._toggleNoContentHelper();
+        this._updateExampleBackground();
+    },
+    /**
+     * @private
+     * @param {KeyboardEvent} e
+     */
+    _onRecordKeyDown: function(e) {
+        switch(e.which) {
+            case $.ui.keyCode.DOWN:
+                this._focusOnNextCard(e.currentTarget);
+                e.stopPropagation();
+                e.preventDefault();
+                break;
+            case $.ui.keyCode.UP:
+                const previousFocused = this._focusOnPreviousCard(e.currentTarget);
+                if (!previousFocused) {
+                    this.trigger_up('navigation_move', { direction: 'up' });
+                }
+                e.stopPropagation();
+                e.preventDefault();
+                break;
+            case $.ui.keyCode.RIGHT:
+                this._focusOnCardInColumn(e.currentTarget, 'RIGHT');
+                e.stopPropagation();
+                e.preventDefault();
+                break;
+            case $.ui.keyCode.LEFT:
+                this._focusOnCardInColumn(e.currentTarget, 'LEFT');
+                e.stopPropagation();
+                e.preventDefault();
+                break;
+        }
     },
     /**
      * Updates progressbar internal states (necessary for animations) with
@@ -455,6 +663,21 @@ var KanbanRenderer = BasicRenderer.extend({
      */
     _onStartQuickCreate: function () {
         this._toggleNoContentHelper(true);
+    },
+    /**
+     * Hide or display the background example:
+     *  - displayed when quick create column is display and there is no column else
+     *  - hidden otherwise
+     *
+     * @private
+     **/
+    _updateExampleBackground: function () {
+        var $elem = this.$('.o_kanban_example_background_container');
+        if (!this.state.data.length && !$elem.length) {
+            this._renderExampleBackground(this.$el);
+        } else {
+            $elem.remove();
+        }
     },
 });
 

@@ -2,17 +2,18 @@ odoo.define('base_calendar.base_calendar', function (require) {
 "use strict";
 
 var BasicModel = require('web.BasicModel');
-var field_registry = require('web.field_registry');
+var fieldRegistry = require('web.field_registry');
 var Notification = require('web.Notification');
-var relational_fields = require('web.relational_fields');
+var relationalFields = require('web.relational_fields');
 var session = require('web.session');
 var WebClient = require('web.WebClient');
 
-var FieldMany2ManyTags = relational_fields.FieldMany2ManyTags;
-
+var FieldMany2ManyTags = relationalFields.FieldMany2ManyTags;
 
 var CalendarNotification = Notification.extend({
     template: "CalendarNotification",
+    xmlDependencies: (Notification.prototype.xmlDependencies || [])
+        .concat(['/calendar/static/src/xml/notification_calendar.xml']),
 
     init: function(parent, params) {
         this._super(parent, params);
@@ -36,12 +37,12 @@ var CalendarNotification = Notification.extend({
             },
 
             'click .link2recall': function() {
-                this.destroy(true);
+                this.close();
             },
 
             'click .link2showed': function() {
-                this.destroy(true);
-                this._rpc({route: '/calendar/notify_ack'});
+                this._rpc({route: '/calendar/notify_ack'})
+                    .then(this.close.bind(this, false), this.close.bind(this, false));
             },
         });
     },
@@ -55,24 +56,25 @@ WebClient.include({
         // Clear previously set timeouts and destroy currently displayed calendar notifications
         clearTimeout(this.get_next_calendar_notif_timeout);
         _.each(this.calendar_notif_timeouts, clearTimeout);
-        _.each(this.calendar_notif, function(notif) {
-            if (!notif.isDestroyed()) {
-                notif.destroy();
-            }
-        });
         this.calendar_notif_timeouts = {};
-        this.calendar_notif = {};
 
         // For each notification, set a timeout to display it
         _.each(notifications, function(notif) {
-            self.calendar_notif_timeouts[notif.event_id] = setTimeout(function() {
-                var notification = new CalendarNotification(self.notification_manager, {
+            var key = notif.event_id + ',' + notif.alarm_id;
+            if (key in self.calendar_notif) {
+                return;
+            }
+            self.calendar_notif_timeouts[key] = setTimeout(function () {
+                var notificationID = self.call('notification', 'notify', {
+                    Notification: CalendarNotification,
                     title: notif.title,
-                    text: notif.message,
+                    message: notif.message,
                     eventID: notif.event_id,
+                    onClose: function () {
+                        delete self.calendar_notif[key];
+                    },
                 });
-                self.notification_manager.display(notification);
-                self.calendar_notif[notif.event_id] = notification;
+                self.calendar_notif[key] = notificationID;
             }, notif.timer * 1000);
             last_notif_timer = Math.max(last_notif_timer, notif.timer);
         });
@@ -84,8 +86,10 @@ WebClient.include({
     },
     get_next_calendar_notif: function() {
         session.rpc("/calendar/notify", {}, {shadow: true})
-            .done(this.display_calendar_notif.bind(this))
-            .fail(function(err, ev) {
+            .then(this.display_calendar_notif.bind(this))
+            .guardedCatch(function(reason) { //
+                var err = reason.message;
+                var ev = reason.event;
                 if(err.code === -32098) {
                     // Prevent the CrashManager to display an error
                     // in case of an xhr error not due to a server error
@@ -98,7 +102,7 @@ WebClient.include({
         // in which the current user is involved is created, edited or deleted
         this.calendar_notif_timeouts = {};
         this.calendar_notif = {};
-        this.call('bus_service', 'getBus').on('notification', this, function (notifications) {
+        this.call('bus_service', 'onNotification', this, function (notifications) {
             _.each(notifications, (function (notification) {
                 if (notification[0][1] === 'calendar.alarm') {
                     this.display_calendar_notif(notification[1]);
@@ -114,7 +118,7 @@ BasicModel.include({
      * @private
      * @param {Object} record
      * @param {string} fieldName
-     * @returns {Deferred}
+     * @returns {Promise}
      */
     _fetchSpecialAttendeeStatus: function (record, fieldName) {
         var context = record.getContext({fieldName: fieldName});
@@ -155,6 +159,6 @@ var Many2ManyAttendee = FieldMany2ManyTags.extend({
     },
 });
 
-field_registry.add('many2manyattendee', Many2ManyAttendee);
+fieldRegistry.add('many2manyattendee', Many2ManyAttendee);
 
 });

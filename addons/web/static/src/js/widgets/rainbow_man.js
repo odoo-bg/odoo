@@ -25,18 +25,12 @@ var RainbowMan = Widget.extend({
      * @constructor
      * @param {Object} [options]
      * @param {string} [options.message] Message to be displayed on rainbowman card
-     * @param {string} [options.fadeout='medium'] Delay for rainbowman to disappear
-     *   [options.fadeout='fast'] will make rainbowman dissapear quickly,
-     *   [options.fadeout='medium'] and [options.fadeout='slow'] will wait
-     *     little longer before disappearing (can be used when [options.message]
-     *     is longer),
-     *   [options.fadeout='no'] will keep rainbowman on screen until user clicks
-     *     anywhere outside rainbowman
+     * @param {string} [options.fadeout='medium'] Delay for rainbowman to disappear. 'fast' will make rainbowman dissapear quickly, 'medium' and 'slow' will wait little longer before disappearing (can be used when options.message is longer), 'no' will keep rainbowman on screen until user clicks anywhere outside rainbowman
      * @param {string} [options.img_url] URL of the image to be displayed
      */
     init: function (options) {
         this._super.apply(this, arguments);
-        var rainbowDelay = {slow: 4500, medium: 3500, fast:2000, no: false };
+        var rainbowDelay = {slow: 4500, medium: 3500, fast: 2000, no: false};
         this.options = _.defaults(options || {}, {
             fadeout: 'medium',
             img_url: '/web/static/src/img/smile.svg',
@@ -49,10 +43,15 @@ var RainbowMan = Widget.extend({
      */
     start: function () {
         var self = this;
-        core.bus.on('click', this, function (ev) {
-            if (ev.originalEvent && ev.target.className.indexOf('o_reward') === -1) {
-                this.destroy();
-            }
+        // destroy rainbow man when the user clicks outside
+        // this is done in a setTimeout to prevent the click that triggered the
+        // rainbow man to close it directly
+        setTimeout(function () {
+            core.bus.on('click', self, function (ev) {
+                if (ev.originalEvent && ev.target.className.indexOf('o_reward') === -1) {
+                    this.destroy();
+                }
+            });
         });
         if (this.delay) {
             setTimeout(function () {
